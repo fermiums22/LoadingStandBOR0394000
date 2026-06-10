@@ -24,6 +24,7 @@
 #include "console.h"
 #include "control.h"
 #include "cmd.h"
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -375,7 +376,14 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
-
+  /* B1 user button on PC13 (active-low, internal pull-up) -> brake toggle */
+  {
+    GPIO_InitTypeDef b1 = {0};
+    b1.Pin = GPIO_PIN_13;
+    b1.Mode = GPIO_MODE_INPUT;
+    b1.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(GPIOC, &b1);
+  }
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
@@ -396,6 +404,40 @@ void App_Process(void)
   uint8_t c;
   while (Console_ReadByte(&c)) Cmd_FeedByte((char)c);
   Cmd_StreamTask();
+
+  /* B1 button (PC13, active-low): toggle the brake/output on a debounced press */
+  static GPIO_PinState btn_prev = GPIO_PIN_SET;
+  static uint32_t btn_tick = 0;
+  GPIO_PinState btn = HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13);
+  if (btn == GPIO_PIN_RESET && btn_prev == GPIO_PIN_SET && (HAL_GetTick() - btn_tick) > 200u)
+  {
+    btn_tick = HAL_GetTick();
+    Reg_ToggleOutput();
+    if (Reg_GetMode() == OUT_OFF)
+    {
+      Console_Print("\r\n[BTN] STOP - output off\r\n");
+    }
+    else
+    {
+      char b[80];
+      snprintf(b, sizeof b, "\r\n[BTN] START - calibrating zero, target %ld mA...\r\n",
+               (long)Reg_GetSetpoint_mA());
+      Console_Print(b);
+    }
+  }
+  btn_prev = btn;
+
+  /* log the moment the per-start zero calibration finishes and regulation begins */
+  static bool cal_prev = true;
+  bool cal_now = Reg_IsCalDone();
+  if (cal_now && !cal_prev && Reg_GetMode() == OUT_REG)
+  {
+    char b[96];
+    snprintf(b, sizeof b, "[BTN] zero=%ld mA -> regulating to %ld mA\r\n",
+             (long)Reg_GetZero_mA(), (long)Reg_GetSetpoint_mA());
+    Console_Print(b);
+  }
+  cal_prev = cal_now;
 }
 
 /* USER CODE END 4 */

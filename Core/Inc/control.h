@@ -30,9 +30,15 @@ void       Reg_SetSetpoint_mA(float v);   /* clamps to imax, switches to OUT_REG
 void       Reg_SetManualPct(float pct);   /* sets manual duty, switches to MANUAL  */
 void       Reg_SetKp(float v);
 void       Reg_SetKi(float v);
+void       Reg_SetKd(float v);
 void       Reg_SetImax_mA(float v);
 void       Reg_SetDmaxPct(float v);
 void       Reg_Recalibrate(void);
+void       Reg_ToggleOutput(void);        /* button: OFF <-> regulator (brake)    */
+
+/* getters */
+float      Reg_GetKd(void);
+float      Reg_GetZero_mA(void);          /* calibrated sensor zero offset        */
 
 /* Getters (telemetry / status) ---------------------------------------------*/
 out_mode_t Reg_GetMode(void);

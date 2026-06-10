@@ -25,12 +25,20 @@ extern TIM_HandleTypeDef htim2;
 #define VOLT_2_CURRENT       (6.0240963855f)       /* [mA/mV] = 1000mA / 166mV (ACS724)    */
 #define CURRENT_CAL_SAMPLES  (64u)                 /* samples averaged for sensor zero     */
 #define CURRENT_LPF_K        (0.2f)                /* current low-pass filter coefficient  */
+#define ZERO_PLAUSIBLE_MA    (1500.0f)             /* reject zero offset above this:       */
+                                                   /* means sensor was unpowered at cal    */
 
-/* ---- PI / safety defaults (tunable over UART) -----------------------------*/
-#define DEFAULT_KP           (0.20f)               /* [PWM counts / mA]                    */
-#define DEFAULT_KI           (20.0f)               /* [PWM counts / (mA*s)]                */
+/* ---- PID / safety defaults (tunable over UART, persisted in RTC backup) ----*/
+#define DEFAULT_KP           (2.0f)                /* [PWM counts / mA]                    */
+#define DEFAULT_KI           (0.01f)               /* [PWM counts / (mA*s)]                */
+#define DEFAULT_KD           (0.0f)                /* [PWM counts * s / mA]                */
+#define DEFAULT_SETPOINT_MA  (500.0f)              /* default target current (button start)*/
+#define D_FILT_K             (0.10f)               /* D-term low-pass coefficient          */
 #define DEFAULT_DMAX_PCT     (95.0f)               /* max duty clamp [%]  (safety)         */
 #define DEFAULT_IMAX_MA      (5000.0f)             /* max current setpoint clamp [mA]      */
+
+/* RTC/TAMP backup registers: persist PID + setpoint across reset/power-cycle. */
+#define CFG_MAGIC            (0xB04D0001u)
 
 /* ---- state (ADC ISR is the only writer of *_meas/integ; CLI writes params) */
 static volatile out_mode_t g_mode        = OUT_OFF;
@@ -38,7 +46,10 @@ static volatile uint32_t   g_manual_ccr  = 0;
 static volatile float      g_setpoint_mA = 0.0f;
 static volatile float      g_kp          = DEFAULT_KP;
 static volatile float      g_ki          = DEFAULT_KI;
+static volatile float      g_kd          = DEFAULT_KD;
 static volatile float      g_integ       = 0.0f;
+static volatile float      g_err_z       = 0.0f;   /* previous error (for D term)          */
+static volatile float      g_deriv_filt  = 0.0f;   /* filtered derivative                  */
 static volatile float      g_dmax_pct    = DEFAULT_DMAX_PCT;
 static volatile float      g_imax_mA     = DEFAULT_IMAX_MA;
 
@@ -63,15 +74,47 @@ static void apply_output(uint32_t ccr)
   g_ccr = ccr;
 }
 
+/* ---- config persistence in RTC/TAMP backup registers ---------------------*/
+static uint32_t f2u(float f) { union { float f; uint32_t u; } x; x.f = f; return x.u; }
+static float    u2f(uint32_t u) { union { float f; uint32_t u; } x; x.u = u; return x.f; }
+
+static void cfg_save(void)
+{
+  TAMP->BKP1R = f2u(g_kp);
+  TAMP->BKP2R = f2u(g_ki);
+  TAMP->BKP3R = f2u(g_kd);
+  TAMP->BKP4R = f2u(g_setpoint_mA);
+  TAMP->BKP0R = CFG_MAGIC;            /* write marker last */
+}
+
+static void cfg_load(void)
+{
+  if (TAMP->BKP0R == CFG_MAGIC)
+  {
+    g_kp          = u2f(TAMP->BKP1R);
+    g_ki          = u2f(TAMP->BKP2R);
+    g_kd          = u2f(TAMP->BKP3R);
+    g_setpoint_mA = u2f(TAMP->BKP4R);
+  }
+}
+
 void Reg_Init(void)
 {
   /* ADC self-calibration is mandatory on STM32G0 before conversions. */
   HAL_ADCEx_Calibration_Start(&hadc1);
 
-  g_kp = DEFAULT_KP; g_ki = DEFAULT_KI;
+  /* enable access to the backup domain registers (TAMP_BKPxR) */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  HAL_PWR_EnableBkUpAccess();
+  __HAL_RCC_RTCAPB_CLK_ENABLE();
+
+  g_kp = DEFAULT_KP; g_ki = DEFAULT_KI; g_kd = DEFAULT_KD;
   g_dmax_pct = DEFAULT_DMAX_PCT; g_imax_mA = DEFAULT_IMAX_MA;
-  g_mode = OUT_OFF; g_manual_ccr = 0; g_setpoint_mA = 0.0f; g_integ = 0.0f;
+  g_mode = OUT_OFF; g_manual_ccr = 0; g_setpoint_mA = DEFAULT_SETPOINT_MA;
+  g_integ = 0.0f; g_err_z = 0.0f; g_deriv_filt = 0.0f;
   g_cal_done = false; g_cal_cnt = 0; g_cal_sum = 0.0f; g_I_mA = 0.0f;
+
+  cfg_load();                         /* restore saved PID + setpoint (output stays OFF) */
 
   TIM2->CCR1 = 0;
   TIM2->CCR2 = 0;
@@ -101,7 +144,10 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
     g_cal_sum += i_signed;
     if (++g_cal_cnt >= CURRENT_CAL_SAMPLES)
     {
-      g_zero_mA  = g_cal_sum / (float)CURRENT_CAL_SAMPLES;
+      float z = g_cal_sum / (float)CURRENT_CAL_SAMPLES;
+      /* Implausible offset -> sensor was unpowered during calibration.
+         Fall back to the nominal 2.5 V zero instead of a bogus offset. */
+      g_zero_mA  = (fabsf(z) > ZERO_PLAUSIBLE_MA) ? 0.0f : z;
       g_cal_done = true;
     }
     g_I_mA = 0.0f;
@@ -121,22 +167,27 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 
     case OUT_REG:
     {
-      /* PI current regulator with back-calculation anti-windup. */
-      float err    = g_setpoint_mA - g_I_mA;
-      float p      = g_kp * err;
+      /* PID current regulator with filtered D term and back-calc anti-windup. */
+      float err   = g_setpoint_mA - g_I_mA;
+      float deriv = (err - g_err_z) / CTRL_TS;
+      g_deriv_filt = g_deriv_filt * (1.0f - D_FILT_K) + deriv * D_FILT_K;
+      g_err_z = err;
+
+      float p = g_kp * err;
+      float d = g_kd * g_deriv_filt;
       float outmax = g_dmax_pct * 0.01f * (float)PWM_ARR;
       float out;
       if (g_ki > 0.0f)
       {
         g_integ += err * CTRL_TS;
-        out = p + g_ki * g_integ;
-        if (out > outmax)    { out = outmax; g_integ = (outmax - p) / g_ki; }
-        else if (out < 0.0f) { out = 0.0f;   g_integ = (0.0f   - p) / g_ki; }
+        out = p + g_ki * g_integ + d;
+        if (out > outmax)    { out = outmax; g_integ = (outmax - p - d) / g_ki; }
+        else if (out < 0.0f) { out = 0.0f;   g_integ = (0.0f   - p - d) / g_ki; }
       }
       else
       {
         g_integ = 0.0f;
-        out = p;
+        out = p + d;
         if (out > outmax) out = outmax; else if (out < 0.0f) out = 0.0f;
       }
       ccr = (uint32_t)out;
@@ -147,6 +198,8 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
     default:
       ccr = 0;
       g_integ = 0.0f;
+      g_err_z = 0.0f;
+      g_deriv_filt = 0.0f;
       break;
   }
   apply_output(ccr);
@@ -165,6 +218,7 @@ void Reg_SetSetpoint_mA(float v)
   if (v > g_imax_mA) v = g_imax_mA;
   g_setpoint_mA = v;
   g_mode = OUT_REG;
+  cfg_save();
 }
 
 void Reg_SetManualPct(float pct)
@@ -175,10 +229,29 @@ void Reg_SetManualPct(float pct)
   g_mode = OUT_MANUAL;
 }
 
-void Reg_SetKp(float v)       { g_kp = v; }
-void Reg_SetKi(float v)       { g_ki = v; g_integ = 0.0f; }
+void Reg_SetKp(float v)       { g_kp = v; cfg_save(); }
+void Reg_SetKi(float v)       { g_ki = v; g_integ = 0.0f; cfg_save(); }
+void Reg_SetKd(float v)       { g_kd = v; g_deriv_filt = 0.0f; cfg_save(); }
 void Reg_SetImax_mA(float v)  { if (v < 0.0f) v = 0.0f; g_imax_mA = v; }
 void Reg_SetDmaxPct(float v)  { if (v < 0.0f) v = 0.0f; if (v > 100.0f) v = 100.0f; g_dmax_pct = v; }
+
+/* Button (brake) toggle: OFF -> recalibrate sensor zero, then run regulator;
+   ON -> stop. The zero calibration runs with the output forced to 0 (no
+   current), so the sensor is always re-zeroed right before each start. */
+void Reg_ToggleOutput(void)
+{
+  if (g_mode == OUT_REG)
+  {
+    g_mode = OUT_OFF;
+    g_integ = 0.0f; g_err_z = 0.0f; g_deriv_filt = 0.0f;
+  }
+  else
+  {
+    g_integ = 0.0f; g_err_z = 0.0f; g_deriv_filt = 0.0f;
+    g_cal_sum = 0.0f; g_cal_cnt = 0; g_cal_done = false; g_I_mA = 0.0f;  /* re-zero first */
+    g_mode = OUT_REG;
+  }
+}
 
 void Reg_Recalibrate(void)
 {
@@ -193,6 +266,8 @@ float      Reg_GetSetpoint_mA(void) { return g_setpoint_mA; }
 uint32_t   Reg_GetDutyPct(void)     { return (g_ccr * 100u) / PWM_ARR; }
 float      Reg_GetKp(void)          { return g_kp; }
 float      Reg_GetKi(void)          { return g_ki; }
+float      Reg_GetKd(void)          { return g_kd; }
+float      Reg_GetZero_mA(void)     { return g_zero_mA; }
 float      Reg_GetImax_mA(void)     { return g_imax_mA; }
 float      Reg_GetDmaxPct(void)     { return g_dmax_pct; }
 bool       Reg_IsCalDone(void)      { return g_cal_done; }
