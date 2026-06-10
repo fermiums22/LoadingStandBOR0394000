@@ -1,0 +1,48 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "stlinkgdbtarget",
+            "request": "launch",
+            "name": "STM32Cube: Debug LoadingStandBOR0394000 (ST-Link)",
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/Debug/LoadingStandBOR0394000.elf",
+            "deviceName": "STM32G071RBTx",
+            "deviceCore": "Cortex-M0+",
+            "runEntry": "main",
+            "preLaunchTask": "Build (STM32CubeIDE Debug)",
+            "svdPath": "C:/ST/STM32CubeIDE_2.0.0/STM32CubeIDE/plugins/com.st.stm32cube.ide.mcu.productdb.debug_2.2.300.202510101821/resources/cmsis/STMicroelectronics_CMSIS_SVD/STM32G071.svd",
+            "gdb": "C:/ST/STM32CubeIDE_2.0.0/STM32CubeIDE/plugins/com.st.stm32cube.ide.mcu.externaltools.gnu-tools-for-stm32.13.3.rel1.win32_1.0.100.202509120712/tools/bin/arm-none-eabi-gdb.exe",
+            "serverExe": "C:/ST/STM32CubeIDE_2.0.0/STM32CubeIDE/plugins/com.st.stm32cube.ide.mcu.externaltools.stlink-gdb-server.win32_2.2.300.202509021040/tools/bin/ST-LINK_gdbserver.exe",
+            "serverCubeProgPath": "C:/Program Files/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin",
+            "serverInterface": "SWD",
+            "serverInterfaceFrequency": 4000,
+            "serverVerify": true,
+            "serverReset": true,
+            "liveWatch": {
+                "enabled": true,
+                "samplesPerSecond": 4
+            },
+            "imagesAndSymbols": [
+                {
+                    "imageFileName": "${workspaceFolder}/Debug/LoadingStandBOR0394000.elf",
+                    "symbolFileName": "${workspaceFolder}/Debug/LoadingStandBOR0394000.elf"
+                }
+            ]
+        },
+        {
+            "type": "stlinkgdbtarget",
+            "request": "launch",
+            "name": "STM32Cube: Launch ST-Link GDB Server (auto/context)",
+            "origin": "snippet",
+            "cwd": "${workspaceFolder}",
+            "preBuild": "${command:st-stm32-ide-debug-launch.build}",
+            "runEntry": "main",
+            "imagesAndSymbols": [
+                {
+                    "imageFileName": "${command:st-stm32-ide-debug-launch.get-projects-binary-from-context1}"
+                }
+            ]
+        }
+    ]
+}

@@ -1,0 +1,63 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build (STM32CubeIDE Debug)",
+            "type": "process",
+            "command": "C:/ST/STM32CubeIDE_2.0.0/STM32CubeIDE/stm32cubeidec.exe",
+            "args": [
+                "--launcher.suppressErrors",
+                "-nosplash",
+                "-application",
+                "org.eclipse.cdt.managedbuilder.core.headlessbuild",
+                "-data",
+                "${userHome}/STM32CubeIDE/vscode_ws_LoadingStandBOR0394000",
+                "-importAll",
+                "${workspaceFolder}",
+                "-build",
+                "LoadingStandBOR0394000/Debug"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": "$gcc",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "Clean Build (STM32CubeIDE Debug)",
+            "type": "process",
+            "command": "C:/ST/STM32CubeIDE_2.0.0/STM32CubeIDE/stm32cubeidec.exe",
+            "args": [
+                "--launcher.suppressErrors",
+                "-nosplash",
+                "-application",
+                "org.eclipse.cdt.managedbuilder.core.headlessbuild",
+                "-data",
+                "${userHome}/STM32CubeIDE/vscode_ws_LoadingStandBOR0394000",
+                "-importAll",
+                "${workspaceFolder}",
+                "-cleanBuild",
+                "LoadingStandBOR0394000/Debug"
+            ],
+            "group": "build",
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "Flash (STM32_Programmer_CLI)",
+            "type": "process",
+            "command": "C:/Program Files/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/STM32_Programmer_CLI.exe",
+            "args": [
+                "-c", "port=SWD", "mode=UR",
+                "-d", "${workspaceFolder}/Debug/LoadingStandBOR0394000.elf",
+                "-v",
+                "-rst"
+            ],
+            "dependsOn": "Build (STM32CubeIDE Debug)",
+            "problemMatcher": []
+        }
+    ]
+}

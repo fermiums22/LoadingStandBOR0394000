@@ -171,4 +171,13 @@ void DMA1_Channel2_3_IRQHandler(void)
 
 /* USER CODE BEGIN 1 */
 
+/**
+  * @brief This function handles USART2 global interrupt (ring-buffer TX).
+  */
+void USART2_IRQHandler(void)
+{
+  extern void Console_TxIrq(void);
+  Console_TxIrq();
+}
+
 /* USER CODE END 1 */
