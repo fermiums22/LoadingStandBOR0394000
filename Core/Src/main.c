@@ -47,7 +47,9 @@ DMA_HandleTypeDef hdma_adc1;
 
 TIM_HandleTypeDef htim2;
 
+UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
+DMA_HandleTypeDef hdma_usart1_rx;
 DMA_HandleTypeDef hdma_usart2_rx;
 
 /* USER CODE BEGIN PV */
@@ -60,6 +62,7 @@ static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM2_Init(void);
+static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 void App_Init(void);
 void App_Process(void);
@@ -103,6 +106,7 @@ int main(void)
   MX_USART2_UART_Init();
   MX_ADC1_Init();
   MX_TIM2_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
   App_Init();
   /* USER CODE END 2 */
@@ -112,8 +116,9 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-    App_Process();
+
     /* USER CODE BEGIN 3 */
+    App_Process();   /* inside USER CODE 3 so CubeMX regeneration keeps it */
   }
   /* USER CODE END 3 */
 }
@@ -135,7 +140,7 @@ void SystemClock_Config(void)
   * in the RCC_OscInitTypeDef structure.
   */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-  RCC_OscInitStruct.HSEState = RCC_HSE_BYPASS;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV1;
@@ -190,13 +195,11 @@ static void MX_ADC1_Init(void)
   hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
   hadc1.Init.LowPowerAutoWait = DISABLE;
   hadc1.Init.LowPowerAutoPowerOff = DISABLE;
-  /* One conversion per hardware trigger (timer-paced sampling), not free-running */
   hadc1.Init.ContinuousConvMode = DISABLE;
   hadc1.Init.NbrOfConversion = 1;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
   hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIG_T2_TRGO;
   hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
-  /* Keep DMA requests flowing for every triggered conversion (circular DMA) */
   hadc1.Init.DMAContinuousRequests = ENABLE;
   hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
   hadc1.Init.SamplingTimeCommon1 = ADC_SAMPLETIME_39CYCLES_5;
@@ -245,7 +248,6 @@ static void MX_TIM2_Init(void)
   htim2.Instance = TIM2;
   htim2.Init.Prescaler = 0;
   htim2.Init.CounterMode = TIM_COUNTERMODE_CENTERALIGNED1;
-  /* Center-aligned: Fpwm = Ftim / (2*ARR) = 64MHz / (2*3200) = 10 kHz */
   htim2.Init.Period = 3200;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV2;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
@@ -262,17 +264,13 @@ static void MX_TIM2_Init(void)
   {
     Error_Handler();
   }
-  /* TRGO = Update event -> periodic ADC trigger synchronized to the PWM.
-     (Was TIM_TRGO_ENABLE, which pulses only once when the timer starts,
-      so the ADC was never triggered periodically.) */
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_OC4REF;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
   {
     Error_Handler();
   }
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  /* Start at 0% duty: transistor OFF until current-sensor zero calibration is done */
   sConfigOC.Pulse = 0;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
@@ -280,15 +278,70 @@ static void MX_TIM2_Init(void)
   {
     Error_Handler();
   }
-  sConfigOC.Pulse = 0;
   if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
   {
     Error_Handler();
   }
+  sConfigOC.Pulse = 160;
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE BEGIN TIM2_Init 2 */
-
+  /* CH4 (no GPIO) + TRGO=OC4REF are now configured from the .ioc above: OC4REF's
+     rising edge triggers the ADC once per PWM period near the ON-pulse center.
+     Pulse(CCR4) = advance before center; it is set/tuned at runtime in control.c
+     (apply_output / Reg_SetTrigAdv), adapting to duty for short vs long pulses. */
   /* USER CODE END TIM2_Init 2 */
   HAL_TIM_MspPostInit(&htim2);
+
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 921600;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart1.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart1, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart1, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
 
 }
 
@@ -366,6 +419,7 @@ static void MX_DMA_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
 
   /* USER CODE END MX_GPIO_Init_1 */
@@ -375,6 +429,22 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOF_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : B1_BUTTON_Pin */
+  GPIO_InitStruct.Pin = B1_BUTTON_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(B1_BUTTON_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PA8 */
+  GPIO_InitStruct.Pin = GPIO_PIN_8;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
   /* USER CODE BEGIN MX_GPIO_Init_2 */
   /* B1 user button on PC13 (active-low, internal pull-up) -> brake toggle */
   {
@@ -383,6 +453,18 @@ static void MX_GPIO_Init(void)
     b1.Mode = GPIO_MODE_INPUT;
     b1.Pull = GPIO_PULLUP;
     HAL_GPIO_Init(GPIOC, &b1);
+  }
+  /* PA8 = ADC scope marker: pulsed HIGH in the ADC conv-complete ISR for the
+     ON-pulse-center sample. Probe PA8 vs PA5/PA1 (PWM) to verify the sampling
+     instant lands inside the PWM ON pulse. Push-pull, very-high speed, starts low. */
+  {
+    GPIO_InitTypeDef tp = {0};
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_RESET);
+    tp.Pin   = GPIO_PIN_8;
+    tp.Mode  = GPIO_MODE_OUTPUT_PP;
+    tp.Pull  = GPIO_NOPULL;
+    tp.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    HAL_GPIO_Init(GPIOA, &tp);
   }
   /* USER CODE END MX_GPIO_Init_2 */
 }
@@ -401,43 +483,43 @@ void App_Init(void)
 
 void App_Process(void)
 {
-  uint8_t c;
-  while (Console_ReadByte(&c)) Cmd_FeedByte((char)c);
+  uint8_t c; int port;
+  while (Console_ReadByte(&c, &port)) Cmd_FeedByte(port, (char)c);
   Cmd_StreamTask();
 
-  /* B1 button (PC13, active-low): toggle the brake/output on a debounced press */
+  /* B1 button (PC13, active-low): OFF + ten increasing current-regulation steps. */
+  static const struct { float mA; const char *name; } seq[] = {
+    { 0.0f,    "1 OFF"        },
+    { 50.0f,   "2 REG 50 mA"  },
+    { 100.0f,  "3 REG 100 mA" },
+    { 150.0f,  "4 REG 150 mA" },
+    { 200.0f,  "5 REG 200 mA" },
+    { 300.0f,  "6 REG 300 mA" },
+    { 500.0f,  "7 REG 500 mA" },
+    { 700.0f,  "8 REG 700 mA" },
+    { 1000.0f, "9 REG 1 A"    },
+    { 1500.0f, "10 REG 1.5 A" },
+    { 2000.0f, "11 REG 2 A"   },
+  };
+  const int NSEQ = (int)(sizeof seq / sizeof seq[0]);
+
+  static int           seq_idx  = 0;            /* current step (0 = OFF at boot) */
   static GPIO_PinState btn_prev = GPIO_PIN_SET;
-  static uint32_t btn_tick = 0;
+  static uint32_t      btn_tick = 0;
   GPIO_PinState btn = HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13);
   if (btn == GPIO_PIN_RESET && btn_prev == GPIO_PIN_SET && (HAL_GetTick() - btn_tick) > 200u)
   {
     btn_tick = HAL_GetTick();
-    Reg_ToggleOutput();
-    if (Reg_GetMode() == OUT_OFF)
-    {
-      Console_Print("\r\n[BTN] STOP - output off\r\n");
-    }
-    else
-    {
-      char b[80];
-      snprintf(b, sizeof b, "\r\n[BTN] START - calibrating zero, target %ld mA...\r\n",
-               (long)Reg_GetSetpoint_mA());
-      Console_Print(b);
-    }
-  }
-  btn_prev = btn;
+    seq_idx = (seq_idx + 1) % NSEQ;             /* advance to the next state */
 
-  /* log the moment the per-start zero calibration finishes and regulation begins */
-  static bool cal_prev = true;
-  bool cal_now = Reg_IsCalDone();
-  if (cal_now && !cal_prev && Reg_GetMode() == OUT_REG)
-  {
-    char b[96];
-    snprintf(b, sizeof b, "[BTN] zero=%ld mA -> regulating to %ld mA\r\n",
-             (long)Reg_GetZero_mA(), (long)Reg_GetSetpoint_mA());
+    if (seq_idx == 0) Reg_SetMode(OUT_OFF);
+    else              Reg_SetSetpoint_mA(seq[seq_idx].mA);
+
+    char b[64];
+    snprintf(b, sizeof b, "\r\n[BTN] step %s (of %d)\r\n", seq[seq_idx].name, NSEQ);
     Console_Print(b);
   }
-  cal_prev = cal_now;
+  btn_prev = btn;
 }
 
 /* USER CODE END 4 */

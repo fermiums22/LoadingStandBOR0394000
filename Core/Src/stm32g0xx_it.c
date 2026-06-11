@@ -46,7 +46,7 @@
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN PFP */
-
+extern void Console_UartIrq(void *huart);   /* dual-console ring-buffer TX drain */
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -56,7 +56,10 @@
 
 /* External variables --------------------------------------------------------*/
 extern DMA_HandleTypeDef hdma_adc1;
+extern DMA_HandleTypeDef hdma_usart1_rx;
 extern DMA_HandleTypeDef hdma_usart2_rx;
+extern UART_HandleTypeDef huart1;
+extern UART_HandleTypeDef huart2;
 /* USER CODE BEGIN EV */
 
 /* USER CODE END EV */
@@ -164,20 +167,40 @@ void DMA1_Channel2_3_IRQHandler(void)
 
   /* USER CODE END DMA1_Channel2_3_IRQn 0 */
   HAL_DMA_IRQHandler(&hdma_adc1);
+  HAL_DMA_IRQHandler(&hdma_usart1_rx);
   /* USER CODE BEGIN DMA1_Channel2_3_IRQn 1 */
 
   /* USER CODE END DMA1_Channel2_3_IRQn 1 */
 }
 
-/* USER CODE BEGIN 1 */
+/**
+  * @brief This function handles USART1 global interrupt / USART1 wake-up interrupt through EXTI line 25.
+  */
+void USART1_IRQHandler(void)
+{
+  /* USER CODE BEGIN USART1_IRQn 0 */
+  Console_UartIrq(&huart1);   /* drain our TX ring; HAL handler below is a no-op for it */
+  /* USER CODE END USART1_IRQn 0 */
+  HAL_UART_IRQHandler(&huart1);
+  /* USER CODE BEGIN USART1_IRQn 1 */
+
+  /* USER CODE END USART1_IRQn 1 */
+}
 
 /**
-  * @brief This function handles USART2 global interrupt (ring-buffer TX).
+  * @brief This function handles USART2 global interrupt / USART2 wake-up interrupt through EXTI line 26.
   */
 void USART2_IRQHandler(void)
 {
-  extern void Console_TxIrq(void);
-  Console_TxIrq();
+  /* USER CODE BEGIN USART2_IRQn 0 */
+  Console_UartIrq(&huart2);   /* drain our TX ring; HAL handler below is a no-op for it */
+  /* USER CODE END USART2_IRQn 0 */
+  HAL_UART_IRQHandler(&huart2);
+  /* USER CODE BEGIN USART2_IRQn 1 */
+
+  /* USER CODE END USART2_IRQn 1 */
 }
+
+/* USER CODE BEGIN 1 */
 
 /* USER CODE END 1 */

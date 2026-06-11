@@ -21,21 +21,27 @@
 #define CMD_BUF_SIZE     (96u)
 #define LED_MANUAL_PCT   (50.0f)        /* duty applied by "led on" */
 #define HIST_N           (8u)           /* command history depth */
+#define NCON             CONSOLE_NPORT  /* one independent console per UART port */
 
-static char     cmd_buf[CMD_BUF_SIZE];
-static uint16_t cmd_len = 0;
-static bool     led_state = false;
+/* Per-console state: each terminal has its own line editor, history and stream,
+   so USART2 (ST-Link VCP) and USART1 (Raspberry Pi) work independently. The
+   underlying hardware/controller is shared - only the console I/O is split. */
+typedef struct {
+  char     cmd_buf[CMD_BUF_SIZE];
+  uint16_t cmd_len;
+  char     hist[HIST_N][CMD_BUF_SIZE];  /* newest at hist[hist_count-1] */
+  int      hist_count;
+  int      hist_nav;                    /* == hist_count means "fresh line" */
+  uint8_t  esc_state;                   /* 0:normal 1:got ESC 2:got '[' */
+  bool     stream_on;                   /* DATA,... telemetry stream   */
+  bool     streamA_on;                  /* current-only monitor (Amps) */
+  uint32_t stream_rate;                 /* [ms] */
+  uint32_t stream_last;
+} cmd_ctx_t;
 
-/* command history (newest at hist[hist_count-1]) + line-editor state */
-static char     hist[HIST_N][CMD_BUF_SIZE];
-static int      hist_count = 0;
-static int      hist_nav   = 0;         /* == hist_count means "fresh line" */
-static uint8_t  esc_state  = 0;         /* 0:normal 1:got ESC 2:got '[' */
-
-static bool     stream_on   = false;    /* DATA,... telemetry stream     */
-static bool     streamA_on  = false;    /* current-only monitor (Amps)   */
-static uint32_t stream_rate = 100;      /* [ms], shared by both streams  */
-static uint32_t stream_last = 0;
+static cmd_ctx_t g_ctx[NCON];
+static cmd_ctx_t *g_cur = &g_ctx[0];    /* console currently being serviced */
+static bool       led_state = false;    /* shared HW state (LED/transistor)  */
 
 /* Format a float with 3 decimals WITHOUT pulling in newlib float-printf. */
 static void f3(char *b, size_t n, float v)
@@ -73,14 +79,14 @@ static void f_amps(char *b, size_t n, float mA)
   snprintf(b, n, "%c%ld.%04ld A", sign, u / 10000, u % 10000);
 }
 
-/* Set the shared stream period from a rate in Hz (1..1000). false if invalid. */
+/* Set the active console's stream period from a rate in Hz (1..1000). */
 static bool set_rate_hz(const char *s)
 {
   long hz = strtol(s, NULL, 10);
   if (hz < 1 || hz > 1000) return false;
   uint32_t ms = (uint32_t)(1000 / hz);
   if (ms < 1) ms = 1;
-  stream_rate = ms;
+  g_cur->stream_rate = ms;
   return true;
 }
 
@@ -98,13 +104,20 @@ static void cmd_help(void)
   Console_Print("  imax <mA>            - max current setpoint (safety)\r\n");
   Console_Print("  dmax <0..100>        - max duty clamp % (safety)\r\n");
   Console_Print("  cal                  - re-run current-sensor zero calibration\r\n");
-  Console_Print("  stream on|off [Hz]   - DATA,<tick_ms>,<set_mA>,<I_mA>,<duty%>\r\n");
-  Console_Print("  streamA on|off [Hz]  - current only, e.g.  0.5000 A\r\n");
+  Console_Print("  vref [N]             - ADC self-check vs internal 1.21V ref (N samples)\r\n");
+  Console_Print("  ain [N]              - measure A3=PB1 (IN9) vs known voltage, w/ VDDA\r\n");
+  Console_Print("  chan pa0|pb1         - live measure channel: PA0 sensor / PB1 A3 test\r\n");
+  Console_Print("  trig [cnt]           - ADC sample point: counts before ON-pulse center\r\n");
+  Console_Print("  flt [raw] [mA]       - current filter windows (avg samples), e.g. flt 16 64\r\n");
+  Console_Print("  cpu                  - ADC-ISR exec time / CPU load (last,max), resets max\r\n");
+  Console_Print("  stream on|off [Hz]   - DATA,<tick_ms>,<set_mA>,<I_mA>,<duty%> (this console)\r\n");
+  Console_Print("  streamA on|off [Hz]  - current only, e.g.  0.5000 A (this console)\r\n");
   Console_Print("  rate <ms>            - stream period (alt to [Hz])\r\n");
   Console_Print("  status               - print current state\r\n");
   Console_Print("  logo                 - show the BORK banner\r\n");
   Console_Print("  reset | reboot       - restart the controller\r\n");
-  Console_Print("  (Up/Down arrows recall command history)\r\n");
+  Console_Print("  (Up/Down = history; Ctrl+C/Ctrl+Z = stop this console's stream)\r\n");
+  Console_Print("  (the 2 consoles are independent; only one stream type at a time)\r\n");
 }
 
 static void cmd_status(void)
@@ -119,8 +132,14 @@ static void cmd_status(void)
            m, (long)Reg_GetSetpoint_mA(), (long)Reg_GetCurrent_mA(),
            (unsigned long)Reg_GetDutyPct(), Reg_IsCalDone() ? 1 : 0);
   Console_Print(b);
-  snprintf(b, sizeof b, "       kp=%s ki=%s kd=%s imax=%ldmA dmax=%ld%%\r\n",
-           fp, fi, fd, (long)Reg_GetImax_mA(), (long)Reg_GetDmaxPct());
+  snprintf(b, sizeof b, "       kp=%s ki=%s kd=%s imax=%ldmA dmax=%ld%% trig=%lucnt meas=%s\r\n",
+           fp, fi, fd, (long)Reg_GetImax_mA(), (long)Reg_GetDmaxPct(),
+           (unsigned long)Reg_GetTrigAdv(), Reg_GetMeasInOff() ? "OFF-ctr" : "ON-ctr");
+  Console_Print(b);
+  char fvp[24]; f3(fvp, sizeof fvp, Reg_GetPinVoltage_mV() / 1000.0f);
+  snprintf(b, sizeof b, "       chan=%s raw_avg=%u Vpin=%s V flt=%u/%u\r\n",
+           (Reg_GetAdcChannel() == ADC_CHANNEL_9) ? "PB1" : "PA0",
+           Reg_GetRawAvg(), fvp, Reg_GetRawWin(), Reg_GetMaWin());
   Console_Print(b);
 }
 
@@ -237,16 +256,104 @@ static void cmd_dispatch(char *line)
     return;
   }
 
+  if (!strcmp(cmd, "trig"))
+  {
+    if (arg) Reg_SetTrigAdv((uint32_t)strtol(arg, NULL, 10));
+    snprintf(b, sizeof b, "OK trig=%lu cnt (~%lu ns before center)\r\n",
+             (unsigned long)Reg_GetTrigAdv(),
+             (unsigned long)(Reg_GetTrigAdv() * 1000u / 64u));
+    Console_Print(b);
+    return;
+  }
+
+  if (!strcmp(cmd, "cpu"))
+  {
+    /* ADC-ISR load: HCLK=64MHz, ISR rate 10kHz -> period 6400 cyc; us=cyc/64, %=cyc/64. */
+    uint32_t last = Reg_GetIsrLastCyc(), mx = Reg_GetIsrMaxCyc();
+    snprintf(b, sizeof b, "CPU isr last=%lu.%lu us  max=%lu.%lu us  (%lu%% peak)\r\n",
+             (unsigned long)(last / 64u), (unsigned long)((last % 64u) * 10u / 64u),
+             (unsigned long)(mx / 64u),   (unsigned long)((mx % 64u) * 10u / 64u),
+             (unsigned long)(mx / 64u));
+    Console_Print(b);
+    Reg_ResetIsrMax();
+    return;
+  }
+
+  if (!strcmp(cmd, "flt"))
+  {
+    if (arg)
+    {
+      long rw = strtol(arg, NULL, 10);
+      char *p2 = strtok(NULL, " \t");
+      long mw = p2 ? strtol(p2, NULL, 10) : (long)Reg_GetMaWin();
+      Reg_SetFilter((uint8_t)rw, (uint8_t)mw);
+    }
+    unsigned lag = ((unsigned)Reg_GetRawWin() - 1u + (unsigned)Reg_GetMaWin() - 1u) * 100u / 2u; /* us */
+    snprintf(b, sizeof b, "OK flt raw=%u mA=%u samples (lag ~%u.%u ms)\r\n",
+             Reg_GetRawWin(), Reg_GetMaWin(), lag / 1000u, (lag % 1000u) / 100u);
+    Console_Print(b);
+    return;
+  }
+
+  if (!strcmp(cmd, "chan"))
+  {
+    if (arg && !strcmp(arg, "pa0"))      { Reg_SetAdcChannel(ADC_CHANNEL_0); Console_Print("OK chan PA0 (current sensor)\r\n"); }
+    else if (arg && !strcmp(arg, "pb1")) { Reg_SetAdcChannel(ADC_CHANNEL_9); Console_Print("OK chan PB1 (A3 bench test)\r\n"); }
+    else { snprintf(b, sizeof b, "chan=%s\r\n", (Reg_GetAdcChannel() == ADC_CHANNEL_9) ? "PB1" : "PA0"); Console_Print(b); }
+    return;
+  }
+
+  if (!strcmp(cmd, "ain"))
+  {
+    /* Absolute voltage check on A3=PB1 (ADC1_IN9) vs a known reference.
+       (named 'ain', not 'a3' - the parser splits a digit off the command word) */
+    uint16_t n = 256;
+    if (arg) { long a = strtol(arg, NULL, 10); if (a >= 1 && a <= 4096) n = (uint16_t)a; }
+    vref_diag_t d;
+    Reg_A3Diag(&d, n);
+    char line[96], fv[24], fd[24];
+    f3(fv, sizeof fv, d.vref_mV / 1000.0f);
+    f3(fd, sizeof fd, d.vdda_mV / 1000.0f);
+    snprintf(line, sizeof line, "A3(PB1) n=%u raw avg=%ld min=%u max=%u spread=%u\r\n",
+             d.n, (long)(d.raw_avg + 0.5f), d.raw_min, d.raw_max,
+             (unsigned)(d.raw_max - d.raw_min));
+    Console_Print(line);
+    snprintf(line, sizeof line, "     V_A3=%s V (%ld mV)  VDDA=%s V  calfact=%lu\r\n",
+             fv, (long)(d.vref_mV + 0.5f), fd, (unsigned long)Reg_GetCalFact());
+    Console_Print(line);
+    return;
+  }
+
+  if (!strcmp(cmd, "vref"))
+  {
+    /* ADC sanity check against the internal 1.21 V reference. */
+    uint16_t n = 256;
+    if (arg) { long a = strtol(arg, NULL, 10); if (a >= 1 && a <= 4096) n = (uint16_t)a; }
+    vref_diag_t d;
+    Reg_VrefDiag(&d, n);
+    char fv[24], fd[24], line[96];
+    f3(fv, sizeof fv, d.vref_mV / 1000.0f);
+    f3(fd, sizeof fd, d.vdda_mV / 1000.0f);
+    snprintf(line, sizeof line, "VREF n=%u raw avg=%ld min=%u max=%u spread=%u\r\n",
+             d.n, (long)(d.raw_avg + 0.5f), d.raw_min, d.raw_max,
+             (unsigned)(d.raw_max - d.raw_min));
+    Console_Print(line);
+    snprintf(line, sizeof line, "     Vref=%s V  VDDA=%s V\r\n", fv, fd);
+    Console_Print(line);
+    return;
+  }
+
   if (!strcmp(cmd, "stream"))
   {
     if (arg && !strcmp(arg, "on"))
     {
       char *hz = strtok(NULL, " \t");
       if (hz && !set_rate_hz(hz)) { Console_Print("ERR rate must be 1..1000 Hz\r\n"); return; }
-      stream_on = true; stream_last = HAL_GetTick();
-      Console_Print("OK stream on\r\n");
+      g_cur->streamA_on = false;            /* only one stream type per console */
+      g_cur->stream_on = true; g_cur->stream_last = HAL_GetTick();
+      Console_Print("OK stream on (Ctrl+C/Ctrl+Z to stop)\r\n");
     }
-    else if (arg && !strcmp(arg, "off")) { stream_on = false; Console_Print("OK stream off\r\n"); }
+    else if (arg && !strcmp(arg, "off")) { g_cur->stream_on = false; Console_Print("OK stream off\r\n"); }
     else Console_Print("ERR stream on|off [Hz]\r\n");
     return;
   }
@@ -257,10 +364,11 @@ static void cmd_dispatch(char *line)
     {
       char *hz = strtok(NULL, " \t");
       if (hz && !set_rate_hz(hz)) { Console_Print("ERR rate must be 1..1000 Hz\r\n"); return; }
-      streamA_on = true; stream_last = HAL_GetTick();
-      Console_Print("OK streamA on\r\n");
+      g_cur->stream_on = false;             /* only one stream type per console */
+      g_cur->streamA_on = true; g_cur->stream_last = HAL_GetTick();
+      Console_Print("OK streamA on (Ctrl+C/Ctrl+Z to stop)\r\n");
     }
-    else if (arg && !strcmp(arg, "off")) { streamA_on = false; Console_Print("OK streamA off\r\n"); }
+    else if (arg && !strcmp(arg, "off")) { g_cur->streamA_on = false; Console_Print("OK streamA off\r\n"); }
     else Console_Print("ERR streamA on|off [Hz]\r\n");
     return;
   }
@@ -270,7 +378,7 @@ static void cmd_dispatch(char *line)
     if (!arg) { Console_Print("ERR rate <ms>\r\n"); return; }
     long r = strtol(arg, NULL, 10);
     if (r < 1) r = 1;
-    stream_rate = (uint32_t)r;
+    g_cur->stream_rate = (uint32_t)r;
     snprintf(b, sizeof b, "OK rate %ld ms\r\n", r); Console_Print(b);
     return;
   }
@@ -280,111 +388,148 @@ static void cmd_dispatch(char *line)
 
 void Cmd_Init(void)
 {
-  cmd_len = 0;
-  stream_on = false;
-  streamA_on = false;
-  stream_rate = 100;
-  hist_count = 0;
-  hist_nav = 0;
-  esc_state = 0;
+  for (int i = 0; i < NCON; i++)
+  {
+    g_ctx[i].cmd_len     = 0;
+    g_ctx[i].stream_on   = false;
+    g_ctx[i].streamA_on  = false;
+    g_ctx[i].stream_rate = 100;
+    g_ctx[i].stream_last = 0;
+    g_ctx[i].hist_count  = 0;
+    g_ctx[i].hist_nav    = 0;
+    g_ctx[i].esc_state   = 0;
+  }
+  g_cur = &g_ctx[0];
 }
 
 /* Redraw the edit line: CR, erase to end of line, reprint the buffer. */
 static void line_redraw(void)
 {
-  cmd_buf[cmd_len] = '\0';
+  g_cur->cmd_buf[g_cur->cmd_len] = '\0';
   Console_Print("\r\033[K");
-  if (cmd_len) Console_Print(cmd_buf);
+  if (g_cur->cmd_len) Console_Print(g_cur->cmd_buf);
 }
 
 static void hist_store(const char *s)
 {
+  cmd_ctx_t *cx = g_cur;
   if (s[0] == '\0') return;
-  if (hist_count > 0 && !strcmp(hist[hist_count - 1], s)) return;  /* skip duplicate */
-  if (hist_count < (int)HIST_N)
+  if (cx->hist_count > 0 && !strcmp(cx->hist[cx->hist_count - 1], s)) return;  /* skip dup */
+  if (cx->hist_count < (int)HIST_N)
   {
-    strncpy(hist[hist_count], s, CMD_BUF_SIZE - 1);
-    hist[hist_count][CMD_BUF_SIZE - 1] = '\0';
-    hist_count++;
+    strncpy(cx->hist[cx->hist_count], s, CMD_BUF_SIZE - 1);
+    cx->hist[cx->hist_count][CMD_BUF_SIZE - 1] = '\0';
+    cx->hist_count++;
   }
   else
   {
-    for (int k = 1; k < (int)HIST_N; k++) strcpy(hist[k - 1], hist[k]);
-    strncpy(hist[HIST_N - 1], s, CMD_BUF_SIZE - 1);
-    hist[HIST_N - 1][CMD_BUF_SIZE - 1] = '\0';
+    for (int k = 1; k < (int)HIST_N; k++) strcpy(cx->hist[k - 1], cx->hist[k]);
+    strncpy(cx->hist[HIST_N - 1], s, CMD_BUF_SIZE - 1);
+    cx->hist[HIST_N - 1][CMD_BUF_SIZE - 1] = '\0';
   }
 }
 
 static void hist_recall(int idx)
 {
-  strcpy(cmd_buf, hist[idx]);
-  cmd_len = (uint16_t)strlen(cmd_buf);
+  strcpy(g_cur->cmd_buf, g_cur->hist[idx]);
+  g_cur->cmd_len = (uint16_t)strlen(g_cur->cmd_buf);
   line_redraw();
 }
 
-void Cmd_FeedByte(char c)
+/* Process one received byte for the active console (g_cur already set). */
+static void feed_one(char c)
 {
-  /* arrow keys arrive as ESC '[' 'A'/'B'/'C'/'D' */
-  if (esc_state == 1) { esc_state = (c == '[') ? 2 : 0; return; }
-  if (esc_state == 2)
+  cmd_ctx_t *cx = g_cur;
+
+  /* Ctrl+C / Ctrl+Z: stop this console's stream (lets one terminal stream while
+     the other shows status). Also clears any half-typed line. */
+  if (c == 0x03 || c == 0x1A)
   {
-    if (c == 'A') { if (hist_nav > 0)          { hist_nav--; hist_recall(hist_nav); } }      /* up   */
-    else if (c == 'B') { if (hist_nav < hist_count) { hist_nav++;
-                          if (hist_nav == hist_count) { cmd_len = 0; line_redraw(); }
-                          else hist_recall(hist_nav); } }                                     /* down */
-    /* 'C'/'D' (left/right) ignored */
-    esc_state = 0;
+    if (cx->stream_on || cx->streamA_on)
+    {
+      cx->stream_on = false; cx->streamA_on = false;
+      Console_Print("\r\n[stream stopped]\r\n");
+    }
+    cx->cmd_len = 0; cx->esc_state = 0;
     return;
   }
-  if (c == 0x1B) { esc_state = 1; return; }
+
+  /* arrow keys arrive as ESC '[' 'A'/'B'/'C'/'D' */
+  if (cx->esc_state == 1) { cx->esc_state = (c == '[') ? 2 : 0; return; }
+  if (cx->esc_state == 2)
+  {
+    if (c == 'A') { if (cx->hist_nav > 0)          { cx->hist_nav--; hist_recall(cx->hist_nav); } }   /* up */
+    else if (c == 'B') { if (cx->hist_nav < cx->hist_count) { cx->hist_nav++;
+                          if (cx->hist_nav == cx->hist_count) { cx->cmd_len = 0; line_redraw(); }
+                          else hist_recall(cx->hist_nav); } }                                          /* down */
+    cx->esc_state = 0;
+    return;
+  }
+  if (c == 0x1B) { cx->esc_state = 1; return; }
 
   if (c == '\r' || c == '\n')
   {
     Console_Print("\r\n");                          /* echo newline */
-    if (cmd_len)
+    if (cx->cmd_len)
     {
-      cmd_buf[cmd_len] = '\0';
-      hist_store(cmd_buf);                          /* store before dispatch tokenizes it */
-      cmd_dispatch(cmd_buf);
-      cmd_len = 0;
+      cx->cmd_buf[cx->cmd_len] = '\0';
+      hist_store(cx->cmd_buf);                       /* store before dispatch tokenizes it */
+      cmd_dispatch(cx->cmd_buf);
+      cx->cmd_len = 0;
     }
-    hist_nav = hist_count;
+    cx->hist_nav = cx->hist_count;
   }
   else if (c == '\b' || c == 0x7F)                  /* backspace / DEL */
   {
-    if (cmd_len) { cmd_len--; Console_Print("\b \b"); }
+    if (cx->cmd_len) { cx->cmd_len--; Console_Print("\b \b"); }
   }
   else if ((unsigned char)c >= 0x20)                /* printable ASCII or UTF-8 (Cyrillic) */
   {
-    if (cmd_len < (CMD_BUF_SIZE - 1))
+    if (cx->cmd_len < (CMD_BUF_SIZE - 1))
     {
-      cmd_buf[cmd_len++] = c;
+      cx->cmd_buf[cx->cmd_len++] = c;
       char e[2] = { c, '\0' };
       Console_Print(e);                             /* echo typed byte */
     }
   }
 }
 
+/* Feed a byte tagged with its source console; output is routed back to it only. */
+void Cmd_FeedByte(int port, char c)
+{
+  if (port < 0 || port >= NCON) return;
+  g_cur = &g_ctx[port];
+  Console_Route(port);
+  feed_one(c);
+  Console_Route(CONSOLE_BOTH);                      /* async/global prints broadcast */
+}
+
 void Cmd_StreamTask(void)
 {
-  if (!stream_on && !streamA_on) return;
   uint32_t now = HAL_GetTick();
-  if ((now - stream_last) < stream_rate) return;
-  stream_last = now;
-
   char line[64];
-  if (stream_on)
+  for (int p = 0; p < NCON; p++)
   {
-    snprintf(line, sizeof line, "DATA,%lu,%ld,%ld,%lu\r\n",
-             (unsigned long)now, (long)Reg_GetSetpoint_mA(),
-             (long)Reg_GetCurrent_mA(), (unsigned long)Reg_GetDutyPct());
-    Console_Stream(line);
+    cmd_ctx_t *cx = &g_ctx[p];
+    if (!cx->stream_on && !cx->streamA_on) continue;
+    if ((now - cx->stream_last) < cx->stream_rate) continue;
+    cx->stream_last = now;
+
+    Console_Route(p);                               /* stream only to its own port */
+    if (cx->stream_on)
+    {
+      snprintf(line, sizeof line, "DATA,%lu,%ld,%ld,%lu\r\n",
+               (unsigned long)now, (long)Reg_GetSetpoint_mA(),
+               (long)Reg_GetCurrent_mA(), (unsigned long)Reg_GetDutyPct());
+      Console_Stream(line);
+    }
+    if (cx->streamA_on)
+    {
+      char a[24];
+      f_amps(a, sizeof a, Reg_GetCurrent_mA());
+      snprintf(line, sizeof line, "%s\r\n", a);
+      Console_Stream(line);
+    }
   }
-  if (streamA_on)
-  {
-    char a[24];
-    f_amps(a, sizeof a, Reg_GetCurrent_mA());
-    snprintf(line, sizeof line, "%s\r\n", a);
-    Console_Stream(line);
-  }
+  Console_Route(CONSOLE_BOTH);
 }

@@ -1,11 +1,13 @@
 /**
   ******************************************************************************
   * @file    console.h
-  * @brief   Non-blocking UART console over USART2 (ST-Link VCP), 921600 8N1.
+  * @brief   Dual-UART console, 921600 8N1: USART2 (ST-Link VCP) + USART1
+  *          (PC4/PC5 header, e.g. Raspberry Pi). Both run in parallel.
   *
-  * RX: USART2 + circular DMA ring (drained by polling).
-  * TX: software ring buffer drained by the USART2 TXE interrupt.
-  * No blocking HAL_UART_Transmit / HAL_Delay is used.
+  * RX: each USART + circular DMA ring (drained by polling); bytes from either
+  *     port feed the same parser.
+  * TX: per-port software ring drained by that USART's TXE interrupt; output is
+  *     mirrored to both ports. No blocking HAL_UART_Transmit / HAL_Delay.
   ******************************************************************************
   */
 #ifndef CONSOLE_H
@@ -14,10 +16,14 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-void Console_Init(void);              /* start RX DMA, enable TX interrupt        */
-void Console_Print(const char *s);    /* enqueue a response (priority over stream)*/
+#define CONSOLE_NPORT   2             /* port 0 = USART2 (VCP), port 1 = USART1   */
+#define CONSOLE_BOTH   (-1)           /* route output to every port               */
+
+void Console_Init(void);              /* start RX DMA + TX IRQ on both ports      */
+void Console_Route(int port);         /* set output target: 0,1 or CONSOLE_BOTH   */
+void Console_Print(const char *s);    /* enqueue a response to the routed port(s) */
 void Console_Stream(const char *s);   /* enqueue telemetry, dropped if near full  */
-bool Console_ReadByte(uint8_t *c);    /* pop one received byte; true if available */
-void Console_TxIrq(void);             /* call from USART2_IRQHandler               */
+bool Console_ReadByte(uint8_t *c, int *port);  /* pop a byte + its source port     */
+void Console_UartIrq(void *huart);    /* call from USART1/USART2 IRQHandler        */
 
 #endif /* CONSOLE_H */
