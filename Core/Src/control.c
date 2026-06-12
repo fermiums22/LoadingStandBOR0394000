@@ -31,10 +31,28 @@ extern TIM_HandleTypeDef htim2;
    Ki = 2*pi*fc/Kdc (~94), Kp = Ki*tau (~0.47). See design notes. */
 #define DEFAULT_KP           (0.5f)                /* [PWM counts / mA]                    */
 #define DEFAULT_KI           (90.0f)               /* [PWM counts / (mA*s)]                */
-#define DEFAULT_KD           (0.0f)                /* [PWM counts * s / mA] (off: noisy)   */
 #define DEFAULT_SETPOINT_MA  (500.0f)              /* default target current (button start)*/
 #define DEFAULT_DMAX_PCT     (95.0f)               /* max duty clamp [%]  (safety)         */
 #define DEFAULT_IMAX_MA      (2000.0f)             /* max current setpoint clamp [mA] (0-2A)*/
+
+/* ---- HBM/HBK T22/50 Nm torque sensor on PB1 (Arduino A3 / ADC1_IN9) -------*/
+/* T22 voltage output: +/-5 V at +/-Mnom. For the 50 Nm sensor this is
+   10 Nm/V at the sensor output. The MCP6002 input network is 100k from signal
+   and 54.9k to the 1.65 V reference (built as 51k + 3.9k in series),
+   so PB1 sees:
+     Vadc = (54.9/(100+54.9))*Vsig + (100/(100+54.9))*1.65 V.
+   This is the largest one-resistor-change gain that keeps -3 V barely above
+   ADC ground. ADC sensitivity is about 35.443 mV/Nm. */
+#define T22_NOMINAL_NM       (50.0f)
+#define T22_SENSOR_MV_PER_NM (5000.0f / T22_NOMINAL_NM)
+#define T22_ADC_GAIN_NUM     (549L)
+#define T22_ADC_GAIN_DEN     (1549L)
+#define T22_ZERO_MV          (1650.0f * 1000.0f / 1549.0f)
+#define DEFAULT_MMAX_NM      (50.0f)
+#define DEFAULT_MKP          (35.0f)               /* [mA / Nm] outer loop P gain          */
+#define DEFAULT_MKI          (120.0f)              /* [mA / (Nm*s)] outer loop I gain      */
+#define DEFAULT_MKD          (0.0f)                /* [mA / Nm / sample] abs-torque damping*/
+#define TORQUE_CAL_SAMPLES   (64u)
 
 /* Fast 10 kHz control loop uses fixed-point Q8 (value * 256). STM32G071 is
    Cortex-M0+ without FPU; keeping float and divisions out of the ADC ISR is
@@ -45,8 +63,14 @@ extern TIM_HandleTypeDef htim2;
 #define Q8_TO_FLOAT(v)       ((float)(v) / (float)Q8_ONE)
 #define ADC_TO_MA_Q8_GAIN    (2485L)       /* 3300mV*2/4096 * 1000/166 * 256 */
 #define ADC_TO_MA_Q8_ZERO    (3855422L)    /* 2500mV * 1000/166 * 256        */
+#define ADC_TO_NM_Q8_GAIN_Q10 (5975L)      /* 3300/4096 / 35.443mV/Nm * 256 * 1024 */
+#define ADC_TO_NM_Q8_ZERO    (7689L)       /* nominal PB1 zero = 1.065V = 30.0Nm Q8 */
 #define KP_TO_Q8(v)          ((int32_t)((v) * 256.0f + ((v) >= 0.0f ? 0.5f : -0.5f)))
 #define KI_TO_TICK_Q16(v)    ((int32_t)(((v) * 65536.0f / (float)CTRL_FS_HZ) + ((v) >= 0.0f ? 0.5f : -0.5f)))
+#define NM_TO_Q8(v)          MA_TO_Q8(v)
+#define MKP_TO_Q8(v)         KP_TO_Q8(v)
+#define MKI_TO_TICK_Q16(v)   KI_TO_TICK_Q16(v)
+#define MKD_TO_Q8(v)         KP_TO_Q8(v)
 #define P_TERM_Q8(kp_q8, err_q8) \
   ((int32_t)(((kp_q8) * (err_q8)) >> 8))
 #define I_INC_Q8(ki_tick_q16, err_q8) \
@@ -55,7 +79,9 @@ extern TIM_HandleTypeDef htim2;
 /* RTC/TAMP backup registers: persist PID + setpoint across reset/power-cycle.
    Bump the magic whenever the defaults change so a stale saved config (e.g. the
    old kp=2/ki=0.01) is discarded and the new defaults load on next boot. */
-#define CFG_MAGIC            (0xB04D0002u)
+#define CFG_MAGIC16          (0xB05Eu)
+#define CFG_MAGIC_MASK       (0xFFFF0000u)
+#define CFG_MAGIC_WORD       (CFG_MAGIC16 << 16)
 
 /* ---- state (ADC ISR is the only writer of *_meas/integ; CLI writes params) */
 static volatile out_mode_t g_mode        = OUT_OFF;
@@ -63,9 +89,13 @@ static volatile uint32_t   g_manual_ccr  = 0;
 static volatile float      g_setpoint_mA = 0.0f;
 static volatile float      g_kp          = DEFAULT_KP;
 static volatile float      g_ki          = DEFAULT_KI;
-static volatile float      g_kd          = DEFAULT_KD;
 static volatile float      g_dmax_pct    = DEFAULT_DMAX_PCT;
 static volatile float      g_imax_mA     = DEFAULT_IMAX_MA;
+static volatile float      g_m_setpoint_Nm = 0.0f;
+static volatile float      g_mmax_Nm       = DEFAULT_MMAX_NM;
+static volatile float      g_mkp           = DEFAULT_MKP;
+static volatile float      g_mki           = DEFAULT_MKI;
+static volatile float      g_mkd           = DEFAULT_MKD;
 
 static volatile int32_t    g_setpoint_q8 = 0;
 static volatile int32_t    g_kp_q8       = KP_TO_Q8(DEFAULT_KP);
@@ -74,11 +104,20 @@ static volatile int32_t    g_integ_q8    = 0;      /* integral contribution [PWM
 static volatile int32_t    g_err_z_q8    = 0;      /* previous error, for optional D term  */
 static volatile int32_t    g_I_q8        = 0;      /* filtered measured current [mA Q8]    */
 static volatile int32_t    g_zero_q8     = 0;      /* calibrated sensor zero [mA Q8]       */
+static volatile int32_t    g_M_q8        = 0;      /* filtered measured torque [Nm Q8]     */
+static volatile int32_t    g_M_zero_q8   = 0;      /* calibrated torque zero [Nm Q8]       */
+static volatile int32_t    g_M_set_q8    = 0;      /* torque setpoint [Nm Q8]              */
+static volatile int32_t    g_mkp_q8      = MKP_TO_Q8(DEFAULT_MKP);
+static volatile int32_t    g_mki_tick_q16 = MKI_TO_TICK_Q16(DEFAULT_MKI);
+static volatile int32_t    g_mkd_q8      = MKD_TO_Q8(DEFAULT_MKD);
+static volatile int32_t    g_m_integ_q8  = 0;      /* outer integral contribution [mA Q8]  */
+static volatile int32_t    g_m_abs_z_q8  = 0;      /* previous |torque| for D damping      */
 static volatile uint32_t   g_dmax_ccr    = (95u * PWM_ARR) / 100u;
 static volatile uint32_t   g_ccr         = 0;      /* duty currently applied [counts]      */
 static volatile uint32_t   g_trig_adv    = 160u;   /* ADC trigger advance before center [cnt]*/
 static volatile bool       g_meas_in_off = false;  /* true: sample OFF-pulse center (short)  */
 static volatile int32_t    g_cal_sum_q8  = 0;
+static volatile int32_t    g_m_cal_sum_q8 = 0;
 static volatile uint16_t   g_cal_cnt     = 0;
 static volatile bool       g_cal_done    = false;
 
@@ -94,8 +133,8 @@ static volatile bool       g_cal_done    = false;
 #define DUTY_HYST_LO_CCR      ((19u * PWM_ARR) / 100u)  /* below -> measure in OFF center */
 #define DUTY_HYST_HI_CCR      ((21u * PWM_ARR) / 100u)  /* above -> measure in ON  center */
 
-/* ADC DMA target: one sample per trigger (1 per PWM period), circular. */
-static uint16_t adc_dma[1];
+/* ADC DMA target: current PA0 and torque PB1, both sampled on the same trigger. */
+static uint16_t adc_dma[2];
 
 static uint8_t pow2_shift_u8(uint8_t v)
 {
@@ -110,6 +149,10 @@ static void sync_fixed_params(void)
   g_setpoint_q8 = MA_TO_Q8(g_setpoint_mA);
   g_kp_q8       = KP_TO_Q8(g_kp);
   g_ki_tick_q16 = KI_TO_TICK_Q16(g_ki);
+  g_M_set_q8    = NM_TO_Q8(g_m_setpoint_Nm);
+  g_mkp_q8      = MKP_TO_Q8(g_mkp);
+  g_mki_tick_q16 = MKI_TO_TICK_Q16(g_mki);
+  g_mkd_q8      = MKD_TO_Q8(g_mkd);
   g_dmax_ccr    = (uint32_t)(g_dmax_pct * 0.01f * (float)PWM_ARR);
   if (g_dmax_ccr > PWM_ARR) g_dmax_ccr = PWM_ARR;
 }
@@ -134,6 +177,12 @@ static volatile uint8_t  g_ima_cnt = 0;
 static volatile int32_t  g_ima_sum_q8 = 0;
 static volatile uint8_t  g_ima_shift = 6u;       /* log2(window), or 0xFF if not pow2      */
 
+static volatile int32_t  g_mma_buf[IMA_MAX];
+static volatile uint8_t  g_mma_idx = 0;
+static volatile uint8_t  g_mma_cnt = 0;
+static volatile int32_t  g_mma_sum_q8 = 0;
+static volatile uint16_t g_torque_raw_avg = 0;
+
 /* Live ADC channel: ADC_CHANNEL_0 = PA0 (current sensor, production) or
    ADC_CHANNEL_9 = PB1 (Arduino A3, for bench-testing the chain on a battery). */
 static volatile uint32_t g_adc_chan = ADC_CHANNEL_0;
@@ -143,27 +192,22 @@ static volatile float    g_vdda_mV  = ADC_VREF_MV;   /* updated by vref/ain diag
    it. Also resets the moving-average and the sensor-zero calibration. */
 static void adc_start_live(uint32_t chan)
 {
+  (void)chan;  /* live mode always scans PA0 current + PB1 torque */
   /* Per-channel analog pin config. NB: on STM32G0 the internal pull-up/down
      resistors are disabled by hardware in analog mode (verified: enabling a
      pull-down on PA0 did not move raw_avg), so a defined path to GND / an input
      low-pass must be EXTERNAL (resistor or RC). Keep the pins NOPULL. */
-  if (chan == ADC_CHANNEL_0)
-  {
-    GPIO_InitTypeDef g = {0};
-    g.Pin = GPIO_PIN_0; g.Mode = GPIO_MODE_ANALOG; g.Pull = GPIO_NOPULL;
-    HAL_GPIO_Init(GPIOA, &g);
-  }
-  else if (chan == ADC_CHANNEL_9)
-  {
-    __HAL_RCC_GPIOB_CLK_ENABLE();
-    GPIO_InitTypeDef g = {0};
-    g.Pin = GPIO_PIN_1; g.Mode = GPIO_MODE_ANALOG; g.Pull = GPIO_NOPULL;
-    HAL_GPIO_Init(GPIOB, &g);
-  }
+  GPIO_InitTypeDef g = {0};
+  g.Mode = GPIO_MODE_ANALOG; g.Pull = GPIO_NOPULL;
+  g.Pin = GPIO_PIN_0;
+  HAL_GPIO_Init(GPIOA, &g);
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  g.Pin = GPIO_PIN_1;
+  HAL_GPIO_Init(GPIOB, &g);
 
   HAL_ADC_Stop_DMA(&hadc1);
-  hadc1.Init.ScanConvMode          = ADC_SCAN_DISABLE;
-  hadc1.Init.NbrOfConversion       = 1;
+  hadc1.Init.ScanConvMode          = ADC_SCAN_ENABLE;
+  hadc1.Init.NbrOfConversion       = 2;
   hadc1.Init.ExternalTrigConv      = ADC_EXTERNALTRIG_T2_TRGO;
   hadc1.Init.ExternalTrigConvEdge  = ADC_EXTERNALTRIGCONVEDGE_RISING;
   hadc1.Init.DMAContinuousRequests = ENABLE;
@@ -171,19 +215,24 @@ static void adc_start_live(uint32_t chan)
   HAL_ADC_Init(&hadc1);
 
   ADC_ChannelConfTypeDef c = {0};
-  c.Channel      = chan;
+  c.Channel      = ADC_CHANNEL_0;
   c.Rank         = ADC_REGULAR_RANK_1;
   c.SamplingTime = ADC_SAMPLINGTIME_COMMON_1;
+  HAL_ADC_ConfigChannel(&hadc1, &c);
+  c.Channel      = ADC_CHANNEL_9;
+  c.Rank         = ADC_REGULAR_RANK_2;
   HAL_ADC_ConfigChannel(&hadc1, &c);
 
   /* clear both MA buffers too: the running sums subtract buf[idx], so stale
      entries would corrupt them after a reset. */
   for (uint16_t k = 0; k < MA_MAX; k++)  g_ma_buf[k]  = 0;
   for (uint16_t k = 0; k < IMA_MAX; k++) g_ima_buf[k] = 0;
+  for (uint16_t k = 0; k < IMA_MAX; k++) g_mma_buf[k] = 0;
   g_ma_idx = 0; g_ma_sum = 0; g_ma_cnt = 0; g_raw_avg = 0;
   g_ima_idx = 0; g_ima_sum_q8 = 0; g_ima_cnt = 0;
-  g_cal_done = false; g_cal_cnt = 0; g_cal_sum_q8 = 0; g_I_q8 = 0;
-  HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_dma, 1);
+  g_mma_idx = 0; g_mma_sum_q8 = 0; g_mma_cnt = 0; g_torque_raw_avg = 0;
+  g_cal_done = false; g_cal_cnt = 0; g_cal_sum_q8 = 0; g_m_cal_sum_q8 = 0; g_I_q8 = 0; g_M_q8 = 0;
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_dma, 2);
 }
 
 /* Clamp duty to the configured safety maximum and drive both PWM outputs:
@@ -227,26 +276,65 @@ static void apply_output(uint32_t ccr)
 }
 
 /* ---- config persistence in RTC/TAMP backup registers ---------------------*/
-static uint32_t f2u(float f) { union { float f; uint32_t u; } x; x.f = f; return x.u; }
-static float    u2f(uint32_t u) { union { float f; uint32_t u; } x; x.u = u; return x.f; }
+static uint16_t f_to_u16(float v, float scale, uint16_t maxv)
+{
+  if (v < 0.0f) v = 0.0f;
+  float x = v * scale + 0.5f;
+  if (x > (float)maxv) return maxv;
+  return (uint16_t)x;
+}
+
+static float u16_to_f(uint16_t v, float scale)
+{
+  return (float)v / scale;
+}
+
+static uint32_t pack2(uint16_t hi, uint16_t lo)
+{
+  return ((uint32_t)hi << 16) | (uint32_t)lo;
+}
+
+static uint16_t hi16(uint32_t v) { return (uint16_t)(v >> 16); }
+static uint16_t lo16(uint32_t v) { return (uint16_t)v; }
+
+static uint16_t pack_limits(float imax_mA, float dmax_pct)
+{
+  uint16_t imax10 = f_to_u16(imax_mA, 0.1f, 511u);  /* 0..5110 mA, 10 mA/LSB */
+  uint16_t dmax1  = f_to_u16(dmax_pct, 1.0f, 100u); /* 0..100%, 1%/LSB       */
+  return (uint16_t)((dmax1 << 9) | imax10);
+}
+
+static void unpack_limits(uint16_t p)
+{
+  g_imax_mA  = (float)(p & 0x01FFu) * 10.0f;
+  g_dmax_pct = (float)((p >> 9) & 0x007Fu);
+}
 
 static void cfg_save(void)
 {
-  TAMP->BKP1R = f2u(g_kp);
-  TAMP->BKP2R = f2u(g_ki);
-  TAMP->BKP3R = f2u(g_kd);
-  TAMP->BKP4R = f2u(g_setpoint_mA);
-  TAMP->BKP0R = CFG_MAGIC;            /* write marker last */
+  TAMP->BKP1R = pack2(f_to_u16(g_kp, 256.0f, 0xFFFFu),
+                      f_to_u16(g_ki, 10.0f, 0xFFFFu));
+  TAMP->BKP2R = pack2(0u,
+                      f_to_u16(g_setpoint_mA, 1.0f, 0xFFFFu));
+  TAMP->BKP3R = pack2(f_to_u16(g_mkp, 256.0f, 0xFFFFu),
+                      f_to_u16(g_mki, 10.0f, 0xFFFFu));
+  TAMP->BKP4R = pack2(f_to_u16(g_mkd, 256.0f, 0xFFFFu),
+                      f_to_u16(g_mmax_Nm, 10.0f, 0xFFFFu));
+  TAMP->BKP0R = CFG_MAGIC_WORD | pack_limits(g_imax_mA, g_dmax_pct);  /* marker last */
 }
 
 static void cfg_load(void)
 {
-  if (TAMP->BKP0R == CFG_MAGIC)
+  if ((TAMP->BKP0R & CFG_MAGIC_MASK) == CFG_MAGIC_WORD)
   {
-    g_kp          = u2f(TAMP->BKP1R);
-    g_ki          = u2f(TAMP->BKP2R);
-    g_kd          = u2f(TAMP->BKP3R);
-    g_setpoint_mA = u2f(TAMP->BKP4R);
+    unpack_limits(lo16(TAMP->BKP0R));
+    g_kp            = u16_to_f(hi16(TAMP->BKP1R), 256.0f);
+    g_ki            = u16_to_f(lo16(TAMP->BKP1R), 10.0f);
+    g_setpoint_mA   = u16_to_f(lo16(TAMP->BKP2R), 1.0f);
+    g_mkp           = u16_to_f(hi16(TAMP->BKP3R), 256.0f);
+    g_mki           = u16_to_f(lo16(TAMP->BKP3R), 10.0f);
+    g_mkd           = u16_to_f(hi16(TAMP->BKP4R), 256.0f);
+    g_mmax_Nm       = u16_to_f(lo16(TAMP->BKP4R), 10.0f);
   }
   sync_fixed_params();
 }
@@ -261,12 +349,14 @@ void Reg_Init(void)
   HAL_PWR_EnableBkUpAccess();
   __HAL_RCC_RTCAPB_CLK_ENABLE();
 
-  g_kp = DEFAULT_KP; g_ki = DEFAULT_KI; g_kd = DEFAULT_KD;
-  g_dmax_pct = DEFAULT_DMAX_PCT; g_imax_mA = DEFAULT_IMAX_MA;
+  g_kp = DEFAULT_KP; g_ki = DEFAULT_KI;
+  g_mkp = DEFAULT_MKP; g_mki = DEFAULT_MKI; g_mkd = DEFAULT_MKD;
+  g_dmax_pct = DEFAULT_DMAX_PCT; g_imax_mA = DEFAULT_IMAX_MA; g_mmax_Nm = DEFAULT_MMAX_NM;
   g_mode = OUT_OFF; g_manual_ccr = 0; g_setpoint_mA = DEFAULT_SETPOINT_MA;
+  g_m_setpoint_Nm = 0.0f;
   sync_fixed_params();
-  g_integ_q8 = 0; g_err_z_q8 = 0;
-  g_cal_done = false; g_cal_cnt = 0; g_cal_sum_q8 = 0; g_I_q8 = 0;
+  g_integ_q8 = 0; g_err_z_q8 = 0; g_m_integ_q8 = 0; g_m_abs_z_q8 = 0;
+  g_cal_done = false; g_cal_cnt = 0; g_cal_sum_q8 = 0; g_m_cal_sum_q8 = 0; g_I_q8 = 0; g_M_q8 = 0;
 
   cfg_load();                         /* restore saved PID + setpoint (output stays OFF) */
 
@@ -326,10 +416,14 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 
   /* ACS724 current [mA Q8] (signed about the zero point), from averaged raw. */
   int32_t i_signed_q8 = (int32_t)g_raw_avg * ADC_TO_MA_Q8_GAIN - ADC_TO_MA_Q8_ZERO;
+  uint16_t torque_raw = adc_dma[1];
+  g_torque_raw_avg = torque_raw;
+  int32_t m_signed_q8 = (((int32_t)torque_raw * ADC_TO_NM_Q8_GAIN_Q10) >> 10) - ADC_TO_NM_Q8_ZERO;
 
   if (!g_cal_done)
   {
     g_cal_sum_q8 += i_signed_q8;
+    g_m_cal_sum_q8 += m_signed_q8;
     if (++g_cal_cnt >= CURRENT_CAL_SAMPLES)
     {
       int32_t z_q8 = g_cal_sum_q8 >> 6;              /* CURRENT_CAL_SAMPLES = 64 */
@@ -337,9 +431,11 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
          Fall back to the nominal 2.5 V zero instead of a bogus offset. */
       if (z_q8 > MA_TO_Q8(ZERO_PLAUSIBLE_MA) || z_q8 < -MA_TO_Q8(ZERO_PLAUSIBLE_MA)) z_q8 = 0;
       g_zero_q8  = z_q8;
+      g_M_zero_q8 = g_m_cal_sum_q8 >> 6;
       g_cal_done = true;
     }
     g_I_q8 = 0;
+    g_M_q8 = 0;
     apply_output(0);                                    /* force OFF while calibrating */
     isr_done(t0);
     return;
@@ -359,6 +455,15 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
   if (g_ima_cnt == g_ima_win && g_ima_shift != 0xFFu) g_I_q8 = g_ima_sum_q8 >> g_ima_shift;
   else                                               g_I_q8 = g_ima_sum_q8 / (int32_t)g_ima_cnt;
 
+  int32_t m_q8 = m_signed_q8 - g_M_zero_q8;
+  g_mma_sum_q8 -= g_mma_buf[g_mma_idx];
+  g_mma_buf[g_mma_idx] = m_q8;
+  g_mma_sum_q8 += m_q8;
+  if (++g_mma_idx >= g_ima_win) g_mma_idx = 0;
+  if (g_mma_cnt < g_ima_win) g_mma_cnt++;
+  if (g_mma_cnt == g_ima_win && g_ima_shift != 0xFFu) g_M_q8 = g_mma_sum_q8 >> g_ima_shift;
+  else                                               g_M_q8 = g_mma_sum_q8 / (int32_t)g_mma_cnt;
+
   uint32_t ccr;
   switch (g_mode)
   {
@@ -367,7 +472,32 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
       break;
 
     case OUT_REG:
+    case OUT_TORQUE:
     {
+      if (g_mode == OUT_TORQUE)
+      {
+        int32_t m_abs_q8 = (g_M_q8 < 0) ? -g_M_q8 : g_M_q8;
+        int32_t merr_q8 = g_M_set_q8 - m_abs_q8;
+        int32_t md_q8 = -P_TERM_Q8(g_mkd_q8, (m_abs_q8 - g_m_abs_z_q8));
+        int32_t mout_q8 = P_TERM_Q8(g_mkp_q8, merr_q8) + g_m_integ_q8 + md_q8;
+        int32_t imax_q8 = MA_TO_Q8(g_imax_mA);
+        bool msat_hi = (mout_q8 >= imax_q8);
+        bool msat_lo = (mout_q8 <= 0);
+        g_m_abs_z_q8 = m_abs_q8;
+
+        if (g_mki_tick_q16 > 0 && !((msat_hi && merr_q8 > 0) || (msat_lo && merr_q8 < 0)))
+        {
+          g_m_integ_q8 += I_INC_Q8(g_mki_tick_q16, merr_q8);
+          if (g_m_integ_q8 > imax_q8) g_m_integ_q8 = imax_q8;
+          else if (g_m_integ_q8 < -imax_q8) g_m_integ_q8 = -imax_q8;
+          mout_q8 = P_TERM_Q8(g_mkp_q8, merr_q8) + g_m_integ_q8 + md_q8;
+        }
+
+        if (mout_q8 > imax_q8) mout_q8 = imax_q8;
+        else if (mout_q8 < 0)  mout_q8 = 0;
+        g_setpoint_q8 = mout_q8;       /* outer torque loop drives inner current loop */
+      }
+
       /* Fast fixed-point PI. Anti-windup is conditional integration: when the
          duty is already clamped, keep integrating only if the error pulls it
          back toward the linear region. */
@@ -400,6 +530,8 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
       ccr = 0;
       g_integ_q8 = 0;
       g_err_z_q8 = 0;
+      g_m_integ_q8 = 0;
+      g_m_abs_z_q8 = 0;
       break;
   }
   apply_output(ccr);
@@ -566,6 +698,8 @@ uint32_t Reg_GetAdcChannel(void) { return g_adc_chan; }
 uint16_t Reg_GetRawAvg(void)     { return g_raw_avg; }
 /* Voltage at the ADC pin from the moving-average raw and the measured VDDA [mV]. */
 float    Reg_GetPinVoltage_mV(void) { return (float)g_raw_avg * (g_vdda_mV / ADC_FULL_SCALE); }
+uint16_t Reg_GetTorqueRawAvg(void)  { return g_torque_raw_avg; }
+float    Reg_GetTorquePinVoltage_mV(void) { return (float)g_torque_raw_avg * (g_vdda_mV / ADC_FULL_SCALE); }
 
 /* ---- setters --------------------------------------------------------------*/
 void Reg_SetMode(out_mode_t m)
@@ -574,6 +708,8 @@ void Reg_SetMode(out_mode_t m)
   {
     g_integ_q8 = 0;
     g_err_z_q8 = 0;
+    g_m_integ_q8 = 0;
+    g_m_abs_z_q8 = 0;
   }
   g_mode = m;
 }
@@ -584,8 +720,27 @@ void Reg_SetSetpoint_mA(float v)
   if (v > g_imax_mA) v = g_imax_mA;
   g_setpoint_mA = v;
   g_setpoint_q8 = MA_TO_Q8(v);
+  g_m_integ_q8 = 0;
   g_mode = OUT_REG;
   cfg_save();
+}
+
+void Reg_SetTorqueSetpoint_Nm(float v)
+{
+  if (v < 0.0f) v = 0.0f;
+  if (v > g_mmax_Nm) v = g_mmax_Nm;
+  g_m_setpoint_Nm = v;
+  g_M_set_q8 = NM_TO_Q8(v);
+  g_integ_q8 = 0;
+  g_err_z_q8 = 0;
+  g_m_integ_q8 = g_setpoint_q8;  /* bumpless-ish start from present current demand */
+  g_m_abs_z_q8 = (g_M_q8 < 0) ? -g_M_q8 : g_M_q8;
+  if (g_m_integ_q8 < 0) g_m_integ_q8 = 0;
+  {
+    int32_t imax_q8 = MA_TO_Q8(g_imax_mA);
+    if (g_m_integ_q8 > imax_q8) g_m_integ_q8 = imax_q8;
+  }
+  g_mode = OUT_TORQUE;
 }
 
 void Reg_SetManualPct(float pct)
@@ -594,14 +749,21 @@ void Reg_SetManualPct(float pct)
   if (pct > 100.0f) pct = 100.0f;
   g_manual_ccr = (uint32_t)(pct * 0.01f * (float)PWM_ARR);
   if (g_manual_ccr > g_dmax_ccr) g_manual_ccr = g_dmax_ccr;
+  g_integ_q8 = 0;
+  g_err_z_q8 = 0;
+  g_m_integ_q8 = 0;
+  g_m_abs_z_q8 = 0;
   g_mode = OUT_MANUAL;
 }
 
 void Reg_SetKp(float v)       { g_kp = v; sync_fixed_params(); cfg_save(); }
 void Reg_SetKi(float v)       { g_ki = v; sync_fixed_params(); g_integ_q8 = 0; cfg_save(); }
-void Reg_SetKd(float v)       { g_kd = v; sync_fixed_params(); g_err_z_q8 = 0; cfg_save(); }
-void Reg_SetImax_mA(float v)  { if (v < 0.0f) v = 0.0f; g_imax_mA = v; }
-void Reg_SetDmaxPct(float v)  { if (v < 0.0f) v = 0.0f; if (v > 100.0f) v = 100.0f; g_dmax_pct = v; sync_fixed_params(); }
+void Reg_SetMkP(float v)      { g_mkp = v; sync_fixed_params(); cfg_save(); }
+void Reg_SetMkI(float v)      { g_mki = v; sync_fixed_params(); g_m_integ_q8 = 0; cfg_save(); }
+void Reg_SetMkD(float v)      { g_mkd = v; sync_fixed_params(); g_m_abs_z_q8 = (g_M_q8 < 0) ? -g_M_q8 : g_M_q8; cfg_save(); }
+void Reg_SetImax_mA(float v)  { if (v < 0.0f) v = 0.0f; g_imax_mA = v; cfg_save(); }
+void Reg_SetMmax_Nm(float v)  { if (v < 0.0f) v = 0.0f; g_mmax_Nm = v; if (g_m_setpoint_Nm > v) Reg_SetTorqueSetpoint_Nm(v); cfg_save(); }
+void Reg_SetDmaxPct(float v)  { if (v < 0.0f) v = 0.0f; if (v > 100.0f) v = 100.0f; g_dmax_pct = v; sync_fixed_params(); cfg_save(); }
 
 /* ADC trigger advance before the ON-pulse center, in timer counts (1 = 15.6 ns).
    Used for long pulses; short pulses always sample at the center. */
@@ -625,6 +787,7 @@ void Reg_SetFilter(uint8_t raw_win, uint8_t ma_win)
   for (uint16_t k = 0; k < IMA_MAX; k++) g_ima_buf[k] = 0;
   g_ma_idx = 0; g_ma_sum = 0; g_ma_cnt = 0; g_raw_avg = 0;
   g_ima_idx = 0; g_ima_sum_q8 = 0; g_ima_cnt = 0;
+  g_mma_idx = 0; g_mma_sum_q8 = 0; g_mma_cnt = 0; g_torque_raw_avg = 0;
   HAL_NVIC_EnableIRQ(DMA1_Channel2_3_IRQn);
 }
 uint8_t Reg_GetRawWin(void) { return g_ma_win; }
@@ -643,7 +806,9 @@ void Reg_ToggleOutput(void)
   else
   {
     g_integ_q8 = 0; g_err_z_q8 = 0;
-    g_cal_sum_q8 = 0; g_cal_cnt = 0; g_cal_done = false; g_I_q8 = 0;  /* re-zero first */
+    g_m_integ_q8 = 0;
+    g_m_abs_z_q8 = 0;
+    g_cal_sum_q8 = 0; g_m_cal_sum_q8 = 0; g_cal_cnt = 0; g_cal_done = false; g_I_q8 = 0; g_M_q8 = 0;  /* re-zero first */
     g_mode = OUT_REG;
   }
 }
@@ -651,18 +816,25 @@ void Reg_ToggleOutput(void)
 void Reg_Recalibrate(void)
 {
   g_mode = OUT_OFF;
-  g_cal_done = false; g_cal_cnt = 0; g_cal_sum_q8 = 0; g_I_q8 = 0;
+  g_cal_done = false; g_cal_cnt = 0; g_cal_sum_q8 = 0; g_m_cal_sum_q8 = 0; g_I_q8 = 0; g_M_q8 = 0;
+  g_integ_q8 = 0; g_err_z_q8 = 0; g_m_integ_q8 = 0; g_m_abs_z_q8 = 0;
 }
 
 /* ---- getters --------------------------------------------------------------*/
 out_mode_t Reg_GetMode(void)        { return g_mode; }
 float      Reg_GetCurrent_mA(void)  { return Q8_TO_FLOAT(g_I_q8); }
-float      Reg_GetSetpoint_mA(void) { return g_setpoint_mA; }
+float      Reg_GetSetpoint_mA(void) { return (g_mode == OUT_TORQUE) ? Q8_TO_FLOAT(g_setpoint_q8) : g_setpoint_mA; }
+float      Reg_GetTorque_Nm(void)   { return Q8_TO_FLOAT(g_M_q8); }
+float      Reg_GetTorqueAbs_Nm(void) { int32_t m = g_M_q8; return Q8_TO_FLOAT((m < 0) ? -m : m); }
+float      Reg_GetTorqueSetpoint_Nm(void) { return g_m_setpoint_Nm; }
 uint32_t   Reg_GetDutyPct(void)     { return (g_ccr * 100u) / PWM_ARR; }
 float      Reg_GetKp(void)          { return g_kp; }
 float      Reg_GetKi(void)          { return g_ki; }
-float      Reg_GetKd(void)          { return g_kd; }
+float      Reg_GetMkP(void)         { return g_mkp; }
+float      Reg_GetMkI(void)         { return g_mki; }
+float      Reg_GetMkD(void)         { return g_mkd; }
 float      Reg_GetZero_mA(void)     { return Q8_TO_FLOAT(g_zero_q8); }
 float      Reg_GetImax_mA(void)     { return g_imax_mA; }
+float      Reg_GetMmax_Nm(void)     { return g_mmax_Nm; }
 float      Reg_GetDmaxPct(void)     { return g_dmax_pct; }
 bool       Reg_IsCalDone(void)      { return g_cal_done; }

@@ -19,7 +19,7 @@
 /* TIM2 ARR -> Fpwm = 64MHz / (2*PWM_ARR) = 10 kHz (center-aligned). */
 #define PWM_ARR              (3200u)
 
-typedef enum { OUT_OFF = 0, OUT_MANUAL, OUT_REG } out_mode_t;
+typedef enum { OUT_OFF = 0, OUT_MANUAL, OUT_REG, OUT_TORQUE } out_mode_t;
 
 /* Result of the internal-reference ADC sanity check (Reg_VrefDiag). */
 typedef struct {
@@ -50,15 +50,21 @@ void       Reg_SetAdcChannel(uint32_t chan);  /* pass ADC_CHANNEL_0 (PA0) or ADC
 uint32_t   Reg_GetAdcChannel(void);
 uint16_t   Reg_GetRawAvg(void);           /* moving-average raw ADC value                   */
 float      Reg_GetPinVoltage_mV(void);    /* voltage at the ADC pin (raw_avg * VDDA/4096)   */
+uint16_t   Reg_GetTorqueRawAvg(void);     /* last/filtered PB1 raw ADC value                 */
+float      Reg_GetTorquePinVoltage_mV(void); /* PB1 voltage for the torque sensor             */
 
 /* Setters (called from the command parser) ---------------------------------*/
 void       Reg_SetMode(out_mode_t m);
 void       Reg_SetSetpoint_mA(float v);   /* clamps to imax, switches to OUT_REG  */
+void       Reg_SetTorqueSetpoint_Nm(float v); /* clamps to torque limit, switches to OUT_TORQUE */
 void       Reg_SetManualPct(float pct);   /* sets manual duty, switches to MANUAL  */
 void       Reg_SetKp(float v);
 void       Reg_SetKi(float v);
-void       Reg_SetKd(float v);
+void       Reg_SetMkP(float v);
+void       Reg_SetMkI(float v);
+void       Reg_SetMkD(float v);
 void       Reg_SetImax_mA(float v);
+void       Reg_SetMmax_Nm(float v);
 void       Reg_SetDmaxPct(float v);
 void       Reg_SetTrigAdv(uint32_t cnt);  /* ADC trigger advance before center [timer cnt] */
 uint32_t   Reg_GetTrigAdv(void);
@@ -75,17 +81,23 @@ void       Reg_Recalibrate(void);
 void       Reg_ToggleOutput(void);        /* button: OFF <-> regulator (brake)    */
 
 /* getters */
-float      Reg_GetKd(void);
 float      Reg_GetZero_mA(void);          /* calibrated sensor zero offset        */
 
 /* Getters (telemetry / status) ---------------------------------------------*/
 out_mode_t Reg_GetMode(void);
 float      Reg_GetCurrent_mA(void);
 float      Reg_GetSetpoint_mA(void);
+float      Reg_GetTorque_Nm(void);
+float      Reg_GetTorqueAbs_Nm(void);
+float      Reg_GetTorqueSetpoint_Nm(void);
 uint32_t   Reg_GetDutyPct(void);
 float      Reg_GetKp(void);
 float      Reg_GetKi(void);
+float      Reg_GetMkP(void);
+float      Reg_GetMkI(void);
+float      Reg_GetMkD(void);
 float      Reg_GetImax_mA(void);
+float      Reg_GetMmax_Nm(void);
 float      Reg_GetDmaxPct(void);
 bool       Reg_IsCalDone(void);
 

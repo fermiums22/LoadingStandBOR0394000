@@ -35,6 +35,7 @@ typedef struct {
   uint8_t  esc_state;                   /* 0:normal 1:got ESC 2:got '[' */
   bool     stream_on;                   /* DATA,... telemetry stream   */
   bool     streamA_on;                  /* current-only monitor (Amps) */
+  bool     streamM_on;                  /* torque-only monitor (Nm)    */
   uint32_t stream_rate;                 /* [ms] */
   uint32_t stream_last;
 } cmd_ctx_t;
@@ -42,6 +43,8 @@ typedef struct {
 static cmd_ctx_t g_ctx[NCON];
 static cmd_ctx_t *g_cur = &g_ctx[0];    /* console currently being serviced */
 static bool       led_state = false;    /* shared HW state (LED/transistor)  */
+
+static bool set_rate_hz(const char *s);
 
 /* Format a float with 3 decimals WITHOUT pulling in newlib float-printf. */
 static void f3(char *b, size_t n, float v)
@@ -79,6 +82,26 @@ static void f_amps(char *b, size_t n, float mA)
   snprintf(b, n, "%c%ld.%04ld A", sign, u / 10000, u % 10000);
 }
 
+static void f_nm(char *b, size_t n, float nm)
+{
+  int neg = (nm < 0.0f);
+  if (neg) nm = -nm;
+  long ip = (long)nm;
+  long fp = (long)((nm - (float)ip) * 1000.0f + 0.5f);
+  if (fp >= 1000) { ip++; fp -= 1000; }
+  snprintf(b, n, "%s%ld.%03ld Nm", neg ? "-" : " ", ip, fp);
+}
+
+static void start_m_stream(const char *hz)
+{
+  if (hz && !set_rate_hz(hz)) { Console_Print("ERR rate must be 1..1000 Hz\r\n"); return; }
+  g_cur->stream_on = false;
+  g_cur->streamA_on = false;
+  g_cur->streamM_on = true;
+  g_cur->stream_last = HAL_GetTick();
+  Console_Print("OK streamM on (Ctrl+C/Ctrl+Z to stop)\r\n");
+}
+
 /* Set the active console's stream period from a rate in Hz (1..1000). */
 static bool set_rate_hz(const char *s)
 {
@@ -96,12 +119,16 @@ static void cmd_help(void)
   Console_Print("  help                 - this help\r\n");
   Console_Print("  led on|off|toggle    - manual PWM 50%/0 on PA5 (LED+transistor)\r\n");
   Console_Print("  pwm <0..100>         - manual duty %, stops regulator\r\n");
-  Console_Print("  set <mA>             - current setpoint, starts PI regulator\r\n");
+  Console_Print("  set_i <mA> | set <mA>- current setpoint, starts current PI\r\n");
+  Console_Print("  set_m <Nm>           - torque setpoint, starts torque+current loops\r\n");
   Console_Print("  vt on|off            - transistor output on/off (vt off = stop)\r\n");
   Console_Print("  kp [value]           - get/set proportional gain\r\n");
   Console_Print("  ki [value]           - get/set integral gain\r\n");
-  Console_Print("  kd [value]           - get/set derivative gain\r\n");
   Console_Print("  imax <mA>            - max current setpoint (safety)\r\n");
+  Console_Print("  mmax <Nm>            - max torque setpoint (safety)\r\n");
+  Console_Print("  mkp [value]          - get/set torque-loop P gain [mA/Nm]\r\n");
+  Console_Print("  mki [value]          - get/set torque-loop I gain [mA/(Nm*s)]\r\n");
+  Console_Print("  mkd [value]          - get/set torque-loop D damping [mA/Nm/sample]\r\n");
   Console_Print("  dmax <0..100>        - max duty clamp % (safety)\r\n");
   Console_Print("  cal                  - re-run current-sensor zero calibration\r\n");
   Console_Print("  vref [N]             - ADC self-check vs internal 1.21V ref (N samples)\r\n");
@@ -110,8 +137,10 @@ static void cmd_help(void)
   Console_Print("  trig [cnt]           - ADC sample point: counts before ON-pulse center\r\n");
   Console_Print("  flt [raw] [mA]       - current filter windows (avg samples), e.g. flt 16 64\r\n");
   Console_Print("  cpu                  - ADC-ISR exec time / CPU load (last,max), resets max\r\n");
-  Console_Print("  stream on|off [Hz]   - DATA,<tick_ms>,<set_mA>,<I_mA>,<duty%> (this console)\r\n");
+  Console_Print("  stream on|off [Hz]   - DATA,<tick_ms>,<set_mA>,<I_mA>,<set_Nm>,<M_Nm>,<duty%>\r\n");
   Console_Print("  streamA on|off [Hz]  - current only, e.g.  0.5000 A (this console)\r\n");
+  Console_Print("  streamM on|off [Hz]  - torque only, e.g.  12.345 Nm (this console)\r\n");
+  Console_Print("  M [Hz]               - print torque once, or stream torque at Hz\r\n");
   Console_Print("  rate <ms>            - stream period (alt to [Hz])\r\n");
   Console_Print("  status               - print current state\r\n");
   Console_Print("  logo                 - show the BORK banner\r\n");
@@ -124,22 +153,33 @@ static void cmd_status(void)
 {
   char b[160], fp[24], fi[24], fd[24];
   out_mode_t mode = Reg_GetMode();
-  const char *m = (mode == OUT_REG) ? "VT" : (mode == OUT_MANUAL) ? "MANUAL" : "OFF";
+  const char *m = (mode == OUT_TORQUE) ? "TORQUE" : (mode == OUT_REG) ? "CURRENT" : (mode == OUT_MANUAL) ? "PWM" : "OFF";
   f3(fp, sizeof fp, Reg_GetKp());
   f3(fi, sizeof fi, Reg_GetKi());
-  f3(fd, sizeof fd, Reg_GetKd());
-  snprintf(b, sizeof b, "STATUS mode=%s set=%ldmA I=%ldmA duty=%lu%% cal=%d\r\n",
+  snprintf(b, sizeof b, "STATUS mode=%s set=%ldmA I=%ldmA setM=%ldNm M=%ldNm |M|=%ldNm duty=%lu%% cal=%d\r\n",
            m, (long)Reg_GetSetpoint_mA(), (long)Reg_GetCurrent_mA(),
-           (unsigned long)Reg_GetDutyPct(), Reg_IsCalDone() ? 1 : 0);
+           (long)Reg_GetTorqueSetpoint_Nm(), (long)Reg_GetTorque_Nm(),
+           (long)Reg_GetTorqueAbs_Nm(), (unsigned long)Reg_GetDutyPct(), Reg_IsCalDone() ? 1 : 0);
   Console_Print(b);
-  snprintf(b, sizeof b, "       kp=%s ki=%s kd=%s imax=%ldmA dmax=%ld%% trig=%lucnt meas=%s\r\n",
-           fp, fi, fd, (long)Reg_GetImax_mA(), (long)Reg_GetDmaxPct(),
-           (unsigned long)Reg_GetTrigAdv(), Reg_GetMeasInOff() ? "OFF-ctr" : "ON-ctr");
+  snprintf(b, sizeof b, "       kp=%s ki=%s imax=%ldmA mmax=%ldNm dmax=%ld%% trig=%lucnt meas=%s\r\n",
+           fp, fi, (long)Reg_GetImax_mA(), (long)Reg_GetMmax_Nm(),
+           (long)Reg_GetDmaxPct(), (unsigned long)Reg_GetTrigAdv(), Reg_GetMeasInOff() ? "OFF-ctr" : "ON-ctr");
+  Console_Print(b);
+  f3(fp, sizeof fp, Reg_GetMkP());
+  f3(fi, sizeof fi, Reg_GetMkI());
+  f3(fd, sizeof fd, Reg_GetMkD());
+  snprintf(b, sizeof b, "       mkp=%s mki=%s mkd=%s\r\n", fp, fi, fd);
   Console_Print(b);
   char fvp[24]; f3(fvp, sizeof fvp, Reg_GetPinVoltage_mV() / 1000.0f);
-  snprintf(b, sizeof b, "       chan=%s raw_avg=%u Vpin=%s V flt=%u/%u\r\n",
-           (Reg_GetAdcChannel() == ADC_CHANNEL_9) ? "PB1" : "PA0",
+  snprintf(b, sizeof b, "       Iraw=%u Vpa0=%s V flt=%u/%u\r\n",
            Reg_GetRawAvg(), fvp, Reg_GetRawWin(), Reg_GetMaWin());
+  Console_Print(b);
+  f3(fvp, sizeof fvp, Reg_GetTorquePinVoltage_mV() / 1000.0f);
+  snprintf(b, sizeof b, "       Mraw=%u Vpb1=%s V\r\n",
+           Reg_GetTorqueRawAvg(), fvp);
+  Console_Print(b);
+  snprintf(b, sizeof b, "       chan=%s (display only; live ADC scans PA0+PB1)\r\n",
+           (Reg_GetAdcChannel() == ADC_CHANNEL_9) ? "PB1" : "PA0");
   Console_Print(b);
 }
 
@@ -156,7 +196,7 @@ static void cmd_dispatch(char *line)
      "pwm10" -> cmd="pwm", arg="10"; "led on" -> cmd="led", arg="on" */
   char cmd[16];
   int ci = 0;
-  while (tok[ci] >= 'a' && tok[ci] <= 'z' && ci < 15) { cmd[ci] = tok[ci]; ci++; }
+  while (((tok[ci] >= 'a' && tok[ci] <= 'z') || tok[ci] == '_') && ci < 15) { cmd[ci] = tok[ci]; ci++; }
   cmd[ci] = '\0';
   char *arg = (tok[ci] != '\0') ? &tok[ci] : strtok(NULL, " \t");
   char b[64];
@@ -195,11 +235,19 @@ static void cmd_dispatch(char *line)
     return;
   }
 
-  if (!strcmp(cmd, "set"))
+  if (!strcmp(cmd, "set") || !strcmp(cmd, "set_i"))
   {
-    if (!arg) { Console_Print("ERR set <mA>\r\n"); return; }
+    if (!arg) { Console_Print("ERR set_i <mA>\r\n"); return; }
     Reg_SetSetpoint_mA(strtof(arg, NULL));
-    snprintf(b, sizeof b, "OK set %ld mA\r\n", (long)Reg_GetSetpoint_mA()); Console_Print(b);
+    snprintf(b, sizeof b, "OK set_i %ld mA\r\n", (long)Reg_GetSetpoint_mA()); Console_Print(b);
+    return;
+  }
+
+  if (!strcmp(cmd, "set_m"))
+  {
+    if (!arg) { Console_Print("ERR set_m <Nm>\r\n"); return; }
+    Reg_SetTorqueSetpoint_Nm(strtof(arg, NULL));
+    snprintf(b, sizeof b, "OK set_m %ld Nm\r\n", (long)Reg_GetTorqueSetpoint_Nm()); Console_Print(b);
     return;
   }
 
@@ -227,11 +275,27 @@ static void cmd_dispatch(char *line)
     return;
   }
 
-  if (!strcmp(cmd, "kd"))
+  if (!strcmp(cmd, "mkp"))
   {
-    if (arg) Reg_SetKd(strtof(arg, NULL));
-    char f[24]; f3(f, sizeof f, Reg_GetKd());
-    snprintf(b, sizeof b, "OK kd=%s\r\n", f); Console_Print(b);
+    if (arg) Reg_SetMkP(strtof(arg, NULL));
+    char f[24]; f3(f, sizeof f, Reg_GetMkP());
+    snprintf(b, sizeof b, "OK mkp=%s\r\n", f); Console_Print(b);
+    return;
+  }
+
+  if (!strcmp(cmd, "mki"))
+  {
+    if (arg) Reg_SetMkI(strtof(arg, NULL));
+    char f[24]; f3(f, sizeof f, Reg_GetMkI());
+    snprintf(b, sizeof b, "OK mki=%s\r\n", f); Console_Print(b);
+    return;
+  }
+
+  if (!strcmp(cmd, "mkd"))
+  {
+    if (arg) Reg_SetMkD(strtof(arg, NULL));
+    char f[24]; f3(f, sizeof f, Reg_GetMkD());
+    snprintf(b, sizeof b, "OK mkd=%s\r\n", f); Console_Print(b);
     return;
   }
 
@@ -239,6 +303,13 @@ static void cmd_dispatch(char *line)
   {
     if (arg) Reg_SetImax_mA(strtof(arg, NULL));
     snprintf(b, sizeof b, "OK imax=%ld mA\r\n", (long)Reg_GetImax_mA()); Console_Print(b);
+    return;
+  }
+
+  if (!strcmp(cmd, "mmax"))
+  {
+    if (arg) Reg_SetMmax_Nm(strtof(arg, NULL));
+    snprintf(b, sizeof b, "OK mmax=%ld Nm\r\n", (long)Reg_GetMmax_Nm()); Console_Print(b);
     return;
   }
 
@@ -345,11 +416,29 @@ static void cmd_dispatch(char *line)
 
   if (!strcmp(cmd, "stream"))
   {
-    if (arg && !strcmp(arg, "on"))
+    if (arg && (!strcmp(arg, "m") || !strcmp(arg, "moment") || !strcmp(arg, "torque")))
+    {
+      char *op = strtok(NULL, " \t");
+      if (!op || !strcmp(op, "on"))
+      {
+        start_m_stream(strtok(NULL, " \t"));
+      }
+      else if (!strcmp(op, "off"))
+      {
+        g_cur->streamM_on = false;
+        Console_Print("OK streamM off\r\n");
+      }
+      else
+      {
+        start_m_stream(op);
+      }
+    }
+    else if (arg && !strcmp(arg, "on"))
     {
       char *hz = strtok(NULL, " \t");
       if (hz && !set_rate_hz(hz)) { Console_Print("ERR rate must be 1..1000 Hz\r\n"); return; }
       g_cur->streamA_on = false;            /* only one stream type per console */
+      g_cur->streamM_on = false;
       g_cur->stream_on = true; g_cur->stream_last = HAL_GetTick();
       Console_Print("OK stream on (Ctrl+C/Ctrl+Z to stop)\r\n");
     }
@@ -365,11 +454,31 @@ static void cmd_dispatch(char *line)
       char *hz = strtok(NULL, " \t");
       if (hz && !set_rate_hz(hz)) { Console_Print("ERR rate must be 1..1000 Hz\r\n"); return; }
       g_cur->stream_on = false;             /* only one stream type per console */
+      g_cur->streamM_on = false;
       g_cur->streamA_on = true; g_cur->stream_last = HAL_GetTick();
       Console_Print("OK streamA on (Ctrl+C/Ctrl+Z to stop)\r\n");
     }
     else if (arg && !strcmp(arg, "off")) { g_cur->streamA_on = false; Console_Print("OK streamA off\r\n"); }
     else Console_Print("ERR streamA on|off [Hz]\r\n");
+    return;
+  }
+
+  if (!strcmp(cmd, "m") || !strcmp(cmd, "streamm") || !strcmp(cmd, "stream_m") ||
+      !strcmp(cmd, "moment") || !strcmp(cmd, "torque"))
+  {
+    if (!arg)
+    {
+      char mtxt[24];
+      f_nm(mtxt, sizeof mtxt, Reg_GetTorque_Nm());
+      snprintf(b, sizeof b, "%s\r\n", mtxt);
+      Console_Print(b);
+    }
+    else if (!strcmp(arg, "on"))
+    {
+      start_m_stream(strtok(NULL, " \t"));
+    }
+    else if (!strcmp(arg, "off")) { g_cur->streamM_on = false; Console_Print("OK streamM off\r\n"); }
+    else { start_m_stream(arg); }
     return;
   }
 
@@ -393,6 +502,7 @@ void Cmd_Init(void)
     g_ctx[i].cmd_len     = 0;
     g_ctx[i].stream_on   = false;
     g_ctx[i].streamA_on  = false;
+    g_ctx[i].streamM_on  = false;
     g_ctx[i].stream_rate = 100;
     g_ctx[i].stream_last = 0;
     g_ctx[i].hist_count  = 0;
@@ -445,9 +555,9 @@ static void feed_one(char c)
      the other shows status). Also clears any half-typed line. */
   if (c == 0x03 || c == 0x1A)
   {
-    if (cx->stream_on || cx->streamA_on)
+    if (cx->stream_on || cx->streamA_on || cx->streamM_on)
     {
-      cx->stream_on = false; cx->streamA_on = false;
+      cx->stream_on = false; cx->streamA_on = false; cx->streamM_on = false;
       Console_Print("\r\n[stream stopped]\r\n");
     }
     cx->cmd_len = 0; cx->esc_state = 0;
@@ -511,16 +621,17 @@ void Cmd_StreamTask(void)
   for (int p = 0; p < NCON; p++)
   {
     cmd_ctx_t *cx = &g_ctx[p];
-    if (!cx->stream_on && !cx->streamA_on) continue;
+    if (!cx->stream_on && !cx->streamA_on && !cx->streamM_on) continue;
     if ((now - cx->stream_last) < cx->stream_rate) continue;
     cx->stream_last = now;
 
     Console_Route(p);                               /* stream only to its own port */
     if (cx->stream_on)
     {
-      snprintf(line, sizeof line, "DATA,%lu,%ld,%ld,%lu\r\n",
+      snprintf(line, sizeof line, "DATA,%lu,%ld,%ld,%ld,%ld,%lu\r\n",
                (unsigned long)now, (long)Reg_GetSetpoint_mA(),
-               (long)Reg_GetCurrent_mA(), (unsigned long)Reg_GetDutyPct());
+               (long)Reg_GetCurrent_mA(), (long)Reg_GetTorqueSetpoint_Nm(),
+               (long)Reg_GetTorque_Nm(), (unsigned long)Reg_GetDutyPct());
       Console_Stream(line);
     }
     if (cx->streamA_on)
@@ -528,6 +639,13 @@ void Cmd_StreamTask(void)
       char a[24];
       f_amps(a, sizeof a, Reg_GetCurrent_mA());
       snprintf(line, sizeof line, "%s\r\n", a);
+      Console_Stream(line);
+    }
+    if (cx->streamM_on)
+    {
+      char m[24];
+      f_nm(m, sizeof m, Reg_GetTorque_Nm());
+      snprintf(line, sizeof line, "%s\r\n", m);
       Console_Stream(line);
     }
   }
