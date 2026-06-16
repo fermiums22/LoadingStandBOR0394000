@@ -3,8 +3,9 @@
 
 Runs on the Raspberry Pi that hosts the Nucleo. Forwards bytes both ways
 between a TCP port and the UART the stand's console is wired to (USART1 ->
-/dev/ttyAMA5 by default). DriveScope (pc_tool) connects to this TCP port,
-reads the `DATA,...` telemetry stream and sends commands (set_m, stream on).
+/dev/ttyAMA5 by default). Any TCP client connects to this port, reads the
+`DATA,...` telemetry stream and sends console commands (set_m, stream on, ...).
+See the "Remote control over Wi-Fi" section of the README for the protocol.
 
 Pure Python 3 stdlib, no pyserial/socat needed. Baud is set with `stty`.
 
