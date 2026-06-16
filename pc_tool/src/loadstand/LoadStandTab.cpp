@@ -2,20 +2,60 @@
 #include "loadstand/LoadStandClient.h"
 
 #include "imgui.h"
-#include "implot.h"
 
 #include <cstdio>
 
 namespace drivescope {
 
-// "Load Stand" dockable tab: connect to the loading-stand STM32 over the Pi TCP
-// bridge and plot its torque alongside the combine's own plots. Defined here
-// (not in the MainUi.cpp monolith) but is a MainUi member, so it sees privates.
+// Pull new loading-stand samples into the main-plot buffers each frame. The
+// torque is plotted on the MAIN "Plots" graph (see drawPlots), so the existing
+// ruler, autoscale and signal logger all apply -- no separate graph. Called
+// from MainUi::draw() every frame, regardless of the active tab.
+void MainUi::pumpLoadStand()
+{
+    if (!loadStand_.isOpen()) {
+        standLastSamples_ = 0;
+        return;
+    }
+    LoadStandClient::Snapshot s;
+    loadStand_.snapshot(s);
+    if (s.samples == standLastSamples_) return;   // nothing new since last frame
+    standLastSamples_ = s.samples;
+    if (plotPaused_) return;
+
+    const double tRel = clock_.nowSeconds() - plotTimeOrigin_;
+    standXs_.push_back(tRel);
+    standTorque_.push_back(s.lastTorque);
+    standSet_.push_back(s.lastSetpoint);
+    standCur_.push_back(s.lastCurrent);
+
+    // Trim to the same history window the watches use.
+    const double keepAfter = tRel - static_cast<double>(plotHistorySec_);
+    size_t first = 0;
+    while (first < standXs_.size() && standXs_[first] < keepAfter) ++first;
+    if (first > 0) {
+        standXs_.erase(standXs_.begin(), standXs_.begin() + static_cast<std::ptrdiff_t>(first));
+        standTorque_.erase(standTorque_.begin(), standTorque_.begin() + static_cast<std::ptrdiff_t>(first));
+        standSet_.erase(standSet_.begin(), standSet_.begin() + static_cast<std::ptrdiff_t>(first));
+        standCur_.erase(standCur_.begin(), standCur_.begin() + static_cast<std::ptrdiff_t>(first));
+    }
+
+    // Feed the signal logger so "save" includes the stand torque.
+    if (signalLogger_.active()) {
+        char buf[24];
+        std::snprintf(buf, sizeof buf, "%.3f", s.lastTorque);
+        signalLogger_.log(clock_.nowSeconds(), 0, "stand.M_Nm", 0, "Nm", buf);
+    }
+}
+
+// "Load Stand" tab: connection + control only. The torque curve itself shows up
+// on the main Plots graph (toggles below pick which stand series are drawn).
 void MainUi::drawLoadStand()
 {
     LoadStandClient& ls = loadStand_;
 
     ImGui::TextUnformatted("Loading-stand brake (STM32) via Pi serial->TCP bridge");
+    ImGui::TextDisabled("Torque is plotted on the main 'Plots' tab (ruler + save apply there).");
     ImGui::Separator();
 
     // ---- connection -------------------------------------------------------
@@ -26,10 +66,7 @@ void MainUi::drawLoadStand()
     ImGui::InputInt("port", &lsPort_);
     ImGui::SameLine();
     if (!ls.isOpen()) {
-        if (ImGui::Button("Connect")) {
-            ls.clearData();
-            ls.open(lsHost_, lsPort_);
-        }
+        if (ImGui::Button("Connect")) ls.open(lsHost_, lsPort_);
     } else {
         if (ImGui::Button("Disconnect")) ls.close();
     }
@@ -76,40 +113,12 @@ void MainUi::drawLoadStand()
     if (!snap.lastText.empty())
         ImGui::TextDisabled("last: %s", snap.lastText.c_str());
 
-    // ---- plot options -----------------------------------------------------
-    ImGui::Checkbox("setpoint", &lsShowSetpoint_);
-    ImGui::SameLine();
-    ImGui::Checkbox("current (A)", &lsShowCurrent_);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(180);
-    ImGui::SliderFloat("window s", &lsWindowSec_, 2.0f, 120.0f, "%.0f");
-
-    // ---- torque plot ------------------------------------------------------
-    const double nowT = snap.t.empty() ? 0.0 : snap.t.back();
-    if (ImPlot::BeginPlot("##loadstand_torque", ImVec2(-1, -1),
-                          ImPlotFlags_NoMenus | ImPlotFlags_NoMouseText)) {
-        ImPlot::SetupAxes("device time, s", "torque, Nm", 0, ImPlotAxisFlags_AutoFit);
-        ImPlot::SetupAxisLimits(ImAxis_X1, nowT - static_cast<double>(lsWindowSec_),
-                                nowT, ImGuiCond_Always);
-        ImPlot::SetupLegend(ImPlotLocation_NorthWest, 0);
-
-        const int n = static_cast<int>(snap.t.size());
-        if (n > 0) {
-            ImPlot::SetNextLineStyle(ImVec4(0.20f, 0.80f, 1.00f, 1.0f));
-            ImPlot::PlotLine("torque", snap.t.data(), snap.torque.data(), n);
-            if (lsShowSetpoint_) {
-                ImPlot::SetNextLineStyle(ImVec4(1.00f, 0.60f, 0.10f, 1.0f));
-                ImPlot::PlotLine("setpoint", snap.t.data(), snap.setpoint.data(), n);
-            }
-            if (lsShowCurrent_) {
-                ImPlot::SetNextLineStyle(ImVec4(0.55f, 1.00f, 0.40f, 1.0f));
-                ImPlot::PlotLine("current (A)", snap.t.data(), snap.current.data(), n);
-            }
-        } else {
-            ImPlot::PlotDummy("torque");
-        }
-        ImPlot::EndPlot();
-    }
+    // ---- which stand series to draw on the main plot ----------------------
+    ImGui::Separator();
+    ImGui::TextUnformatted("Show on main plot:");
+    ImGui::SameLine(); ImGui::Checkbox("torque",   &standPlotTorque_);
+    ImGui::SameLine(); ImGui::Checkbox("setpoint", &standPlotSetpoint_);
+    ImGui::SameLine(); ImGui::Checkbox("current",  &standPlotCurrent_);
 }
 
 } // namespace drivescope

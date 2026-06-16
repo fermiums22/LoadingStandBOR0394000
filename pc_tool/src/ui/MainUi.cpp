@@ -3330,6 +3330,7 @@ void MainUi::applyConfig(const ToolConfig& config)
 void MainUi::draw()
 {
     updateIo();
+    pumpLoadStand();   // pull loading-stand torque into the main-plot buffers
 
     {
         ImGuiIO& io = ImGui::GetIO();
@@ -9870,6 +9871,24 @@ void MainUi::drawPlots()
             }
             if (!w.xs.empty() && legendHidden_.count(w.name) == 0) {
                 plotted.push_back({&w, col});
+            }
+        }
+
+        // Loading-stand torque series (own buffers, same time base as watches).
+        // Drawn here so the ruler / box-zoom / autoscale of the main plot apply.
+        if (!standXs_.empty()) {
+            const int sn = static_cast<int>(standXs_.size());
+            if (standPlotTorque_) {
+                ImPlot::SetNextLineStyle(ImVec4(0.20f, 0.80f, 1.00f, 1.0f));
+                ImPlot::PlotLine("stand M [Nm]", standXs_.data(), standTorque_.data(), sn);
+            }
+            if (standPlotSetpoint_) {
+                ImPlot::SetNextLineStyle(ImVec4(1.00f, 0.60f, 0.10f, 1.0f));
+                ImPlot::PlotLine("stand set [Nm]", standXs_.data(), standSet_.data(), sn);
+            }
+            if (standPlotCurrent_) {
+                ImPlot::SetNextLineStyle(ImVec4(0.55f, 1.00f, 0.40f, 1.0f));
+                ImPlot::PlotLine("stand I [A]", standXs_.data(), standCur_.data(), sn);
             }
         }
 

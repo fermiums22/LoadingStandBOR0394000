@@ -1023,14 +1023,20 @@ private:
     TcpCanTransport tcp_;
 
     // Loading-stand brake (STM32) telemetry over the Pi serial->TCP bridge.
+    // Connection/control UI lives on the "Load Stand" tab; the torque samples
+    // are fed into these buffers (shared time base) and drawn on the MAIN
+    // Plots graph so the existing ruler / autoscale / signal logger apply.
     LoadStandClient loadStand_;
     char  lsHost_[64]     = "192.168.0.104";
     int   lsPort_         = 5555;
     float lsSetNm_        = 2.0f;
-    float lsWindowSec_    = 20.0f;
-    bool  lsShowSetpoint_ = true;
-    bool  lsShowCurrent_  = false;
     char  lsCmd_[64]      = "";
+    std::vector<double> standXs_, standTorque_, standSet_, standCur_;
+    size_t standLastSamples_   = 0;
+    bool   standPlotTorque_    = true;
+    bool   standPlotSetpoint_  = false;
+    bool   standPlotCurrent_   = false;
+    void   pumpLoadStand();      // append new stand samples each frame
     ICanTransport* activeTransport_ = nullptr;
     std::mutex transportMutex_;
 
