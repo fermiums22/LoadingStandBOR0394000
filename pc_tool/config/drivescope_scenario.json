@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "description": "DriveScope portable launch scenario. Keep this file next to DriveScope.exe.",
+  "transport": "tcp",
+  "autoconnect": false,
+  "tcp": {
+    "enabled": true,
+    "host": "192.168.0.100",
+    "port": 45333,
+    "bus_bitrate": 500000
+  },
+  "slcan": {
+    "enabled": true,
+    "port": "COM3",
+    "baud": 115200,
+    "nominal": "S6",
+    "data": "Y2",
+    "silent": false
+  },
+  "updates": {
+    "motor_firmware": "../INVERTER/APP_MOTOR.bin",
+    "rk_firmware": "../RK/APP_RK.bin",
+    "esp32_firmware_dir": "../SSD202D/app/firmware/esp32",
+    "main_app_script": "",
+    "main_resources_script": "",
+    "recovery_app_dir": "../SSD202D/app",
+    "recovery_ota": "../SSD202D/OTA/SStarOta.bin.gz"
+  },
+  "symbols": [
+    "symbols/symbols_motor.json",
+    "symbols/symbols_rk.json",
+    "symbols/symbols_dd.json",
+    "symbols/symbols_esp32.json"
+  ],
+  "watches": []
+}

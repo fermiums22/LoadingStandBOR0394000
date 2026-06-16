@@ -1,0 +1,14 @@
+[Unit]
+Description=Loading-stand UART (ttyAMA5) to TCP bridge for DriveScope
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+SupplementaryGroups=dialout
+ExecStart=/usr/bin/python3 /home/pi/uart_bridge.py /dev/ttyAMA5 921600 5555
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

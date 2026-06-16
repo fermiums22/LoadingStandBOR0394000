@@ -1,0 +1,22 @@
+{
+  "transport": "slcan",
+  "autoconnect": false,
+  "tcp": {
+    "enabled": false,
+    "host": "192.168.0.103",
+    "port": 45333
+  },
+  "slcan": {
+    "enabled": true,
+    "port": "COM3",
+    "baud": 115200,
+    "nominal": "S6",
+    "data": "Y2",
+    "silent": false
+  },
+  "symbols": [
+    "build/pc-tool/symbols_motor.json",
+    "build/pc-tool/symbols_rk.json"
+  ],
+  "watches": []
+}
