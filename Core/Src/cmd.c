@@ -139,7 +139,7 @@ static void cmd_help(void)
   Console_Print("  trig [cnt]           - ADC sample point: counts before ON-pulse center\r\n");
   Console_Print("  flt [raw] [mA]       - current filter windows (avg samples), e.g. flt 16 64\r\n");
   Console_Print("  cpu                  - ADC-ISR exec time / CPU load (last,max), resets max\r\n");
-  Console_Print("  stream on|off [Hz]   - DATA,<tick_ms>,<set_mA>,<I_mA>,<set_Nm>,<M_Nm>,<duty%>\r\n");
+  Console_Print("  stream on|off [Hz]   - DATA,<tick_ms>,<set_mA>,<I_mA>,<setM_mNm>,<M_mNm>,<duty%>,<dir>\r\n");
   Console_Print("  streamA on|off [Hz]  - current only, e.g.  0.5000 A (this console)\r\n");
   Console_Print("  streamM on|off [Hz]  - torque only, e.g.  12.345 Nm (this console)\r\n");
   Console_Print("  M [Hz]               - print torque once, or stream torque at Hz\r\n");
@@ -692,10 +692,15 @@ void Cmd_StreamTask(void)
     Console_Route(p);                               /* stream only to its own port */
     if (cx->stream_on)
     {
-      snprintf(line, sizeof line, "DATA,%lu,%ld,%ld,%ld,%ld,%lu\r\n",
+      /* Torque setpoint/measured are sent in milli-Nm (x1000) so the PC plot
+         keeps resolution near zero; integer formatting only (no float printf).
+         Trailing dir field: -1/0/+1 = drive direction from the torque sign. */
+      snprintf(line, sizeof line, "DATA,%lu,%ld,%ld,%ld,%ld,%lu,%d\r\n",
                (unsigned long)now, (long)Reg_GetSetpoint_mA(),
-               (long)Reg_GetCurrent_mA(), (long)Reg_GetTorqueSetpoint_Nm(),
-               (long)Reg_GetTorque_Nm(), (unsigned long)Reg_GetDutyPct());
+               (long)Reg_GetCurrent_mA(),
+               (long)(Reg_GetTorqueSetpoint_Nm() * 1000.0f),
+               (long)(Reg_GetTorque_Nm() * 1000.0f),
+               (unsigned long)Reg_GetDutyPct(), (int)Reg_GetTorqueDir());
       Console_Stream(line);
     }
     if (cx->streamA_on)
