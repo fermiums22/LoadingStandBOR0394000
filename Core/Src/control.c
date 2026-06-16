@@ -54,6 +54,27 @@ extern TIM_HandleTypeDef htim2;
 #define DEFAULT_MKD          (0.0f)                /* [mA / Nm / sample] abs-torque damping*/
 #define TORQUE_CAL_SAMPLES   (64u)
 
+/* ---- torque-direction detector + feedforward (dissipative-brake handling) --*/
+/* The brake can only ABSORB torque: a measured torque exists only when the shaft
+   is actually being driven. There is no speed sensor, so the sign of the
+   filtered torque IS the drive direction. We gate the torque PID on this:
+     - |T| below the noise/ripple floor  -> ARMED: hold the table feedforward
+       current only, integrator FROZEN (this is what stops the loop from winding
+       the current to imax when the motor is not pushing / there is no power).
+     - |T| above the floor (debounced)    -> HOLD: PID trims around feedforward
+       to hold the requested |T| precisely.
+   A reversal must cross the |T|<Toff dead-band, so it always re-arms through
+   DIR_ZERO and the integrator is reset on the zero-crossing (no stale windup). */
+#define DEFAULT_TON_NM       (0.3f)    /* enter threshold: |T| above this = load present  */
+#define DEFAULT_TOFF_NM      (0.15f)   /* exit  threshold (hysteresis, < Ton)             */
+#define DEFAULT_TDEB_SAMP    (50u)     /* debounce: consecutive samples > Ton (5 ms @10k) */
+#define FF_MAX_PTS           (8u)      /* feedforward I(T) table breakpoints              */
+
+/* torque-direction states (kept as int8 so the getter is trivial) */
+#define TDIR_NEG  (-1)
+#define TDIR_ZERO (0)
+#define TDIR_POS  (1)
+
 /* Fast 10 kHz control loop uses fixed-point Q8 (value * 256). STM32G071 is
    Cortex-M0+ without FPU; keeping float and divisions out of the ADC ISR is
    the difference between a controller and a very small heater. */
@@ -112,6 +133,17 @@ static volatile int32_t    g_mki_tick_q16 = MKI_TO_TICK_Q16(DEFAULT_MKI);
 static volatile int32_t    g_mkd_q8      = MKD_TO_Q8(DEFAULT_MKD);
 static volatile int32_t    g_m_integ_q8  = 0;      /* outer integral contribution [mA Q8]  */
 static volatile int32_t    g_m_abs_z_q8  = 0;      /* previous |torque| for D damping      */
+
+/* torque-direction detector + feedforward table (see notes above) */
+static volatile int32_t    g_ton_q8   = NM_TO_Q8(DEFAULT_TON_NM);  /* enter threshold [Nm Q8] */
+static volatile int32_t    g_toff_q8  = NM_TO_Q8(DEFAULT_TOFF_NM); /* exit threshold  [Nm Q8] */
+static volatile uint16_t   g_tdeb     = DEFAULT_TDEB_SAMP;         /* debounce sample count   */
+static volatile uint16_t   g_dir_cnt  = 0;         /* debounce counter (ISR-owned)         */
+static volatile int8_t     g_tdir     = TDIR_ZERO; /* detected drive direction (-1/0/+1)   */
+static volatile int32_t    g_iff_q8   = 0;         /* feedforward current at setpoint [mA Q8]*/
+static volatile int32_t    g_ff_t_q8[FF_MAX_PTS];  /* table torque breakpoints [Nm Q8] asc */
+static volatile int32_t    g_ff_i_q8[FF_MAX_PTS];  /* table current values     [mA Q8]     */
+static volatile uint8_t    g_ff_n     = 0;         /* number of table points (0 = no FF)   */
 static volatile uint32_t   g_dmax_ccr    = (95u * PWM_ARR) / 100u;
 static volatile uint32_t   g_ccr         = 0;      /* duty currently applied [counts]      */
 static volatile uint32_t   g_trig_adv    = 160u;   /* ADC trigger advance before center [cnt]*/
@@ -155,6 +187,39 @@ static void sync_fixed_params(void)
   g_mkd_q8      = MKD_TO_Q8(g_mkd);
   g_dmax_ccr    = (uint32_t)(g_dmax_pct * 0.01f * (float)PWM_ARR);
   if (g_dmax_ccr > PWM_ARR) g_dmax_ccr = PWM_ARR;
+}
+
+/* ---- feedforward I(T) table -----------------------------------------------*/
+/* Linear interpolation of the calibrated current for a target torque. Called
+   only when the setpoint/table changes (NOT from the ISR), so 64-bit math is
+   fine here. Outside the breakpoints the endpoints are held (no extrapolation).*/
+static int32_t ff_lookup_q8(int32_t t_q8)
+{
+  uint8_t n = g_ff_n;
+  if (n == 0u)                  return 0;            /* no table -> pure PID    */
+  if (t_q8 <= g_ff_t_q8[0])     return g_ff_i_q8[0];
+  if (t_q8 >= g_ff_t_q8[n - 1]) return g_ff_i_q8[n - 1];
+  for (uint8_t k = 1u; k < n; k++)
+  {
+    if (t_q8 <= g_ff_t_q8[k])
+    {
+      int32_t t0 = g_ff_t_q8[k - 1], t1 = g_ff_t_q8[k];
+      int32_t i0 = g_ff_i_q8[k - 1], i1 = g_ff_i_q8[k];
+      int32_t dt = t1 - t0;
+      if (dt <= 0) return i0;
+      return i0 + (int32_t)(((int64_t)(i1 - i0) * (int64_t)(t_q8 - t0)) / (int64_t)dt);
+    }
+  }
+  return g_ff_i_q8[n - 1];
+}
+
+/* Seed a 2-point default line (0 Nm -> 0 mA) .. (mmax -> imax). Rough, meant to
+   be replaced by bench calibration via the 'ff' command. */
+static void ff_set_default(void)
+{
+  g_ff_t_q8[0] = 0;                       g_ff_i_q8[0] = 0;
+  g_ff_t_q8[1] = NM_TO_Q8(g_mmax_Nm);     g_ff_i_q8[1] = MA_TO_Q8(g_imax_mA);
+  g_ff_n = 2u;
 }
 
 /* ---- moving average + live channel ----------------------------------------*/
@@ -356,9 +421,11 @@ void Reg_Init(void)
   g_m_setpoint_Nm = 0.0f;
   sync_fixed_params();
   g_integ_q8 = 0; g_err_z_q8 = 0; g_m_integ_q8 = 0; g_m_abs_z_q8 = 0;
+  g_tdir = TDIR_ZERO; g_dir_cnt = 0; g_iff_q8 = 0;
   g_cal_done = false; g_cal_cnt = 0; g_cal_sum_q8 = 0; g_m_cal_sum_q8 = 0; g_I_q8 = 0; g_M_q8 = 0;
 
   cfg_load();                         /* restore saved PID + setpoint (output stays OFF) */
+  ff_set_default();                   /* seed rough I(T) line from imax/mmax (calibrate!) */
 
   TIM2->CCR1 = 0;
   TIM2->CCR2 = 0;
@@ -476,21 +543,61 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
     {
       if (g_mode == OUT_TORQUE)
       {
-        int32_t m_abs_q8 = (g_M_q8 < 0) ? -g_M_q8 : g_M_q8;
-        int32_t merr_q8 = g_M_set_q8 - m_abs_q8;
-        int32_t md_q8 = -P_TERM_Q8(g_mkd_q8, (m_abs_q8 - g_m_abs_z_q8));
-        int32_t mout_q8 = P_TERM_Q8(g_mkp_q8, merr_q8) + g_m_integ_q8 + md_q8;
-        int32_t imax_q8 = MA_TO_Q8(g_imax_mA);
-        bool msat_hi = (mout_q8 >= imax_q8);
-        bool msat_lo = (mout_q8 <= 0);
-        g_m_abs_z_q8 = m_abs_q8;
+        int32_t m_signed = g_M_q8;     /* signed filtered torque [Nm Q8] = drive dir   */
+        int32_t m_abs_q8 = (m_signed < 0) ? -m_signed : m_signed;
 
-        if (g_mki_tick_q16 > 0 && !((msat_hi && merr_q8 > 0) || (msat_lo && merr_q8 < 0)))
+        /* --- direction / load detector (the only way to tell the motor is
+           actually pushing, since there is no speed sensor). Hysteresis +
+           debounce reject torque ripple around zero. A reversal must pass the
+           |T|<Toff dead-band, so it re-arms through TDIR_ZERO. */
+        switch (g_tdir)
         {
-          g_m_integ_q8 += I_INC_Q8(g_mki_tick_q16, merr_q8);
-          if (g_m_integ_q8 > imax_q8) g_m_integ_q8 = imax_q8;
-          else if (g_m_integ_q8 < -imax_q8) g_m_integ_q8 = -imax_q8;
-          mout_q8 = P_TERM_Q8(g_mkp_q8, merr_q8) + g_m_integ_q8 + md_q8;
+          case TDIR_POS:
+            if (m_signed < g_toff_q8) { g_tdir = TDIR_ZERO; g_dir_cnt = 0; }
+            break;
+          case TDIR_NEG:
+            if (m_signed > -g_toff_q8) { g_tdir = TDIR_ZERO; g_dir_cnt = 0; }
+            break;
+          default: /* TDIR_ZERO (ARMED) */
+            if (m_signed > g_ton_q8)
+            { if (++g_dir_cnt >= g_tdeb) { g_tdir = TDIR_POS; g_dir_cnt = 0; g_m_integ_q8 = 0; } }
+            else if (m_signed < -g_ton_q8)
+            { if (++g_dir_cnt >= g_tdeb) { g_tdir = TDIR_NEG; g_dir_cnt = 0; g_m_integ_q8 = 0; } }
+            else g_dir_cnt = 0;
+            break;
+        }
+
+        int32_t imax_q8 = MA_TO_Q8(g_imax_mA);
+        int32_t mout_q8;
+
+        if (g_tdir == TDIR_ZERO)
+        {
+          /* ARMED: motor not pushing -> hold the table feedforward only and
+             FREEZE the integrator. This is what keeps the current from winding
+             up to imax when there is no load / no power source. */
+          g_m_integ_q8 = 0;
+          g_m_abs_z_q8 = m_abs_q8;
+          mout_q8 = g_iff_q8;
+        }
+        else
+        {
+          /* HOLD: load present -> PID trims around the feedforward current to
+             hold |T| at the setpoint. integ carries only the trim, so the
+             ARMED->HOLD transition is bumpless (integ=0, mout=I_ff). */
+          int32_t merr_q8 = g_M_set_q8 - m_abs_q8;
+          int32_t md_q8 = -P_TERM_Q8(g_mkd_q8, (m_abs_q8 - g_m_abs_z_q8));
+          g_m_abs_z_q8 = m_abs_q8;
+          mout_q8 = g_iff_q8 + P_TERM_Q8(g_mkp_q8, merr_q8) + g_m_integ_q8 + md_q8;
+          bool msat_hi = (mout_q8 >= imax_q8);
+          bool msat_lo = (mout_q8 <= 0);
+
+          if (g_mki_tick_q16 > 0 && !((msat_hi && merr_q8 > 0) || (msat_lo && merr_q8 < 0)))
+          {
+            g_m_integ_q8 += I_INC_Q8(g_mki_tick_q16, merr_q8);
+            if (g_m_integ_q8 > imax_q8) g_m_integ_q8 = imax_q8;
+            else if (g_m_integ_q8 < -imax_q8) g_m_integ_q8 = -imax_q8;
+            mout_q8 = g_iff_q8 + P_TERM_Q8(g_mkp_q8, merr_q8) + g_m_integ_q8 + md_q8;
+          }
         }
 
         if (mout_q8 > imax_q8) mout_q8 = imax_q8;
@@ -532,6 +639,8 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
       g_err_z_q8 = 0;
       g_m_integ_q8 = 0;
       g_m_abs_z_q8 = 0;
+      g_tdir = TDIR_ZERO;
+      g_dir_cnt = 0;
       break;
   }
   apply_output(ccr);
@@ -710,6 +819,8 @@ void Reg_SetMode(out_mode_t m)
     g_err_z_q8 = 0;
     g_m_integ_q8 = 0;
     g_m_abs_z_q8 = 0;
+    g_tdir = TDIR_ZERO;
+    g_dir_cnt = 0;
   }
   g_mode = m;
 }
@@ -731,15 +842,12 @@ void Reg_SetTorqueSetpoint_Nm(float v)
   if (v > g_mmax_Nm) v = g_mmax_Nm;
   g_m_setpoint_Nm = v;
   g_M_set_q8 = NM_TO_Q8(v);
+  g_iff_q8   = ff_lookup_q8(g_M_set_q8);  /* table feedforward for this setpoint */
   g_integ_q8 = 0;
   g_err_z_q8 = 0;
-  g_m_integ_q8 = g_setpoint_q8;  /* bumpless-ish start from present current demand */
+  g_m_integ_q8 = 0;                       /* trim starts at 0 (FF is the base)   */
   g_m_abs_z_q8 = (g_M_q8 < 0) ? -g_M_q8 : g_M_q8;
-  if (g_m_integ_q8 < 0) g_m_integ_q8 = 0;
-  {
-    int32_t imax_q8 = MA_TO_Q8(g_imax_mA);
-    if (g_m_integ_q8 > imax_q8) g_m_integ_q8 = imax_q8;
-  }
+  g_tdir = TDIR_ZERO; g_dir_cnt = 0;      /* re-arm: wait for the motor to push  */
   g_mode = OUT_TORQUE;
 }
 
@@ -764,6 +872,61 @@ void Reg_SetMkD(float v)      { g_mkd = v; sync_fixed_params(); g_m_abs_z_q8 = (
 void Reg_SetImax_mA(float v)  { if (v < 0.0f) v = 0.0f; g_imax_mA = v; cfg_save(); }
 void Reg_SetMmax_Nm(float v)  { if (v < 0.0f) v = 0.0f; g_mmax_Nm = v; if (g_m_setpoint_Nm > v) Reg_SetTorqueSetpoint_Nm(v); cfg_save(); }
 void Reg_SetDmaxPct(float v)  { if (v < 0.0f) v = 0.0f; if (v > 100.0f) v = 100.0f; g_dmax_pct = v; sync_fixed_params(); cfg_save(); }
+
+/* ---- torque-direction detector params (not persisted; reset to defaults) --*/
+void Reg_SetTon_Nm(float v)
+{
+  if (v < 0.0f) v = 0.0f;
+  g_ton_q8 = NM_TO_Q8(v);
+  if (g_toff_q8 > g_ton_q8) g_toff_q8 = g_ton_q8;   /* keep Toff <= Ton (hysteresis) */
+}
+void Reg_SetToff_Nm(float v)
+{
+  if (v < 0.0f) v = 0.0f;
+  int32_t t = NM_TO_Q8(v);
+  if (t > g_ton_q8) t = g_ton_q8;
+  g_toff_q8 = t;
+}
+void Reg_SetTdeb(uint16_t n) { if (n < 1u) n = 1u; g_tdeb = n; }
+
+float    Reg_GetTon_Nm(void)  { return Q8_TO_FLOAT(g_ton_q8);  }
+float    Reg_GetToff_Nm(void) { return Q8_TO_FLOAT(g_toff_q8); }
+uint16_t Reg_GetTdeb(void)    { return g_tdeb; }
+int8_t   Reg_GetTorqueDir(void)      { return g_tdir; }
+float    Reg_GetFeedforward_mA(void) { return Q8_TO_FLOAT(g_iff_q8); }
+
+/* ---- feedforward I(T) table API (CLI 'ff') --------------------------------*/
+/* Insert/replace a point (kept sorted by torque). Recomputes the active
+   feedforward. Returns false if the table is full. Modifies the table from the
+   CLI context only; the ISR never reads the arrays (only the precomputed
+   g_iff_q8), so no locking is needed. */
+bool Reg_FfAddPoint(float nm, float ma)
+{
+  if (nm < 0.0f) nm = 0.0f;
+  if (ma < 0.0f) ma = 0.0f;
+  int32_t t = NM_TO_Q8(nm), i = MA_TO_Q8(ma);
+  uint8_t k;
+  for (k = 0u; k < g_ff_n; k++)
+  {
+    if (g_ff_t_q8[k] == t) { g_ff_i_q8[k] = i; g_iff_q8 = ff_lookup_q8(g_M_set_q8); return true; }
+    if (g_ff_t_q8[k] >  t) break;
+  }
+  if (g_ff_n >= FF_MAX_PTS) return false;
+  for (uint8_t j = g_ff_n; j > k; j--) { g_ff_t_q8[j] = g_ff_t_q8[j-1]; g_ff_i_q8[j] = g_ff_i_q8[j-1]; }
+  g_ff_t_q8[k] = t; g_ff_i_q8[k] = i; g_ff_n++;
+  g_iff_q8 = ff_lookup_q8(g_M_set_q8);
+  return true;
+}
+void    Reg_FfClear(void)   { g_ff_n = 0u; g_iff_q8 = ff_lookup_q8(g_M_set_q8); }
+void    Reg_FfDefault(void) { ff_set_default(); g_iff_q8 = ff_lookup_q8(g_M_set_q8); }
+uint8_t Reg_FfCount(void)   { return g_ff_n; }
+bool    Reg_FfGetPoint(uint8_t idx, float *nm, float *ma)
+{
+  if (idx >= g_ff_n) return false;
+  if (nm) *nm = Q8_TO_FLOAT(g_ff_t_q8[idx]);
+  if (ma) *ma = Q8_TO_FLOAT(g_ff_i_q8[idx]);
+  return true;
+}
 
 /* ADC trigger advance before the ON-pulse center, in timer counts (1 = 15.6 ns).
    Used for long pulses; short pulses always sample at the center. */
@@ -809,6 +972,7 @@ void Reg_ToggleOutput(void)
     g_m_integ_q8 = 0;
     g_m_abs_z_q8 = 0;
     g_cal_sum_q8 = 0; g_m_cal_sum_q8 = 0; g_cal_cnt = 0; g_cal_done = false; g_I_q8 = 0; g_M_q8 = 0;  /* re-zero first */
+    g_tdir = TDIR_ZERO; g_dir_cnt = 0;
     g_mode = OUT_REG;
   }
 }
@@ -818,6 +982,7 @@ void Reg_Recalibrate(void)
   g_mode = OUT_OFF;
   g_cal_done = false; g_cal_cnt = 0; g_cal_sum_q8 = 0; g_m_cal_sum_q8 = 0; g_I_q8 = 0; g_M_q8 = 0;
   g_integ_q8 = 0; g_err_z_q8 = 0; g_m_integ_q8 = 0; g_m_abs_z_q8 = 0;
+  g_tdir = TDIR_ZERO; g_dir_cnt = 0;
 }
 
 /* ---- getters --------------------------------------------------------------*/

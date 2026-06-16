@@ -129,6 +129,8 @@ static void cmd_help(void)
   Console_Print("  mkp [value]          - get/set torque-loop P gain [mA/Nm]\r\n");
   Console_Print("  mki [value]          - get/set torque-loop I gain [mA/(Nm*s)]\r\n");
   Console_Print("  mkd [value]          - get/set torque-loop D damping [mA/Nm/sample]\r\n");
+  Console_Print("  det [Ton][Toff][deb] - torque-present detector: thresholds [Nm] + debounce\r\n");
+  Console_Print("  ff [Nm mA|def|clear] - feedforward I(T) table (open-loop current vs torque)\r\n");
   Console_Print("  dmax <0..100>        - max duty clamp % (safety)\r\n");
   Console_Print("  cal                  - re-run current-sensor zero calibration\r\n");
   Console_Print("  vref [N]             - ADC self-check vs internal 1.21V ref (N samples)\r\n");
@@ -170,6 +172,17 @@ static void cmd_status(void)
   f3(fd, sizeof fd, Reg_GetMkD());
   snprintf(b, sizeof b, "       mkp=%s mki=%s mkd=%s\r\n", fp, fi, fd);
   Console_Print(b);
+  {
+    char ft[24], fo[24], fff[24];
+    int8_t d = Reg_GetTorqueDir();
+    f3(ft, sizeof ft, Reg_GetTon_Nm());
+    f3(fo, sizeof fo, Reg_GetToff_Nm());
+    f3(fff, sizeof fff, Reg_GetFeedforward_mA());
+    snprintf(b, sizeof b, "       Ton=%s Toff=%s Nm deb=%u dir=%s Iff=%s mA ff=%upts\r\n",
+             ft, fo, Reg_GetTdeb(), (d > 0) ? "POS" : (d < 0) ? "NEG" : "ZERO",
+             fff, Reg_FfCount());
+    Console_Print(b);
+  }
   char fvp[24]; f3(fvp, sizeof fvp, Reg_GetPinVoltage_mV() / 1000.0f);
   snprintf(b, sizeof b, "       Iraw=%u Vpa0=%s V flt=%u/%u\r\n",
            Reg_GetRawAvg(), fvp, Reg_GetRawWin(), Reg_GetMaWin());
@@ -317,6 +330,57 @@ static void cmd_dispatch(char *line)
   {
     if (arg) Reg_SetDmaxPct(strtof(arg, NULL));
     snprintf(b, sizeof b, "OK dmax=%ld%%\r\n", (long)Reg_GetDmaxPct()); Console_Print(b);
+    return;
+  }
+
+  if (!strcmp(cmd, "det"))
+  {
+    /* torque-direction detector: det [Ton_Nm] [Toff_Nm] [deb_samples] */
+    if (arg)
+    {
+      Reg_SetTon_Nm(strtof(arg, NULL));
+      char *p2 = strtok(NULL, " \t");
+      if (p2) { Reg_SetToff_Nm(strtof(p2, NULL));
+        char *p3 = strtok(NULL, " \t");
+        if (p3) Reg_SetTdeb((uint16_t)strtol(p3, NULL, 10)); }
+    }
+    char ft[24], fo[24], db[96];
+    f3(ft, sizeof ft, Reg_GetTon_Nm());
+    f3(fo, sizeof fo, Reg_GetToff_Nm());
+    int8_t d = Reg_GetTorqueDir();
+    snprintf(db, sizeof db, "OK det Ton=%s Toff=%s Nm deb=%u dir=%s\r\n",
+             ft, fo, Reg_GetTdeb(), (d > 0) ? "POS" : (d < 0) ? "NEG" : "ARMED");
+    Console_Print(db);
+    return;
+  }
+
+  if (!strcmp(cmd, "ff"))
+  {
+    /* feedforward table: ff | ff def | ff clear | ff <Nm> <mA> */
+    if (arg && !strcmp(arg, "def"))   { Reg_FfDefault(); Console_Print("OK ff default line\r\n"); return; }
+    if (arg && !strcmp(arg, "clear")) { Reg_FfClear();   Console_Print("OK ff cleared (pure PID)\r\n"); return; }
+    if (arg)
+    {
+      char *p2 = strtok(NULL, " \t");
+      if (!p2) { Console_Print("ERR ff <Nm> <mA> | def | clear\r\n"); return; }
+      if (!Reg_FfAddPoint(strtof(arg, NULL), strtof(p2, NULL)))
+        { Console_Print("ERR ff table full\r\n"); return; }
+      Console_Print("OK ff point\r\n");
+    }
+    /* always print the table */
+    uint8_t n = Reg_FfCount();
+    char ffm[24];
+    f3(ffm, sizeof ffm, Reg_GetFeedforward_mA());
+    snprintf(b, sizeof b, "FF table (%u pts), I_ff@set=%s mA:\r\n", n, ffm);
+    Console_Print(b);
+    for (uint8_t k = 0; k < n; k++)
+    {
+      float nm, ma; Reg_FfGetPoint(k, &nm, &ma);
+      char fn[24], fa[24], fl[96];
+      f3(fn, sizeof fn, nm); f3(fa, sizeof fa, ma);
+      snprintf(fl, sizeof fl, "  [%u] %s Nm -> %s mA\r\n", k, fn, fa);
+      Console_Print(fl);
+    }
     return;
   }
 

@@ -66,6 +66,25 @@ void       Reg_SetMkD(float v);
 void       Reg_SetImax_mA(float v);
 void       Reg_SetMmax_Nm(float v);
 void       Reg_SetDmaxPct(float v);
+
+/* Torque-direction detector (no speed sensor: sign of |T| = drive direction).
+   Ton/Toff = enter/exit thresholds (hysteresis), tdeb = debounce sample count. */
+void       Reg_SetTon_Nm(float v);
+void       Reg_SetToff_Nm(float v);
+void       Reg_SetTdeb(uint16_t n);
+float      Reg_GetTon_Nm(void);
+float      Reg_GetToff_Nm(void);
+uint16_t   Reg_GetTdeb(void);
+int8_t     Reg_GetTorqueDir(void);        /* -1 / 0 (armed) / +1                 */
+float      Reg_GetFeedforward_mA(void);   /* table current for the active setpoint */
+
+/* Feedforward I(T) table: linearly-interpolated open-loop current applied
+   before the motor produces torque (and as the base the torque PID trims). */
+bool       Reg_FfAddPoint(float nm, float ma);  /* insert/replace, sorted by Nm  */
+void       Reg_FfClear(void);                    /* empty table -> pure PID       */
+void       Reg_FfDefault(void);                  /* 2-point line (0,0)..(mmax,imax)*/
+uint8_t    Reg_FfCount(void);
+bool       Reg_FfGetPoint(uint8_t idx, float *nm, float *ma);
 void       Reg_SetTrigAdv(uint32_t cnt);  /* ADC trigger advance before center [timer cnt] */
 uint32_t   Reg_GetTrigAdv(void);
 bool       Reg_GetMeasInOff(void);        /* true: sampling OFF-pulse center (short duty)   */

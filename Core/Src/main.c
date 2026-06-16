@@ -488,19 +488,20 @@ void App_Process(void)
   while (Console_ReadByte(&c, &port)) Cmd_FeedByte(port, (char)c);
   Cmd_StreamTask();
 
-  /* B1 button (PC13, active-low): OFF + ten increasing current-regulation steps. */
-  static const struct { float mA; const char *name; } seq[] = {
-    { 0.0f,    "1 OFF"        },
-    { 50.0f,   "2 REG 50 mA"  },
-    { 100.0f,  "3 REG 100 mA" },
-    { 150.0f,  "4 REG 150 mA" },
-    { 200.0f,  "5 REG 200 mA" },
-    { 300.0f,  "6 REG 300 mA" },
-    { 500.0f,  "7 REG 500 mA" },
-    { 700.0f,  "8 REG 700 mA" },
-    { 1000.0f, "9 REG 1 A"    },
-    { 1500.0f, "10 REG 1.5 A" },
-    { 2000.0f, "11 REG 2 A"   },
+  /* B1 button (PC13, active-low): OFF + increasing TORQUE setpoints (1..25 Nm).
+     Torque mode arms the feedforward and only closes the PID loop once the shaft
+     is actually driven (hand-rotated) - so at 0 / no motion it does NOT run away.*/
+  static const struct { float Nm; const char *name; } seq[] = {
+    {  0.0f, "1 OFF"      },
+    {  1.0f, "2 M 1 Nm"   },
+    {  2.0f, "3 M 2 Nm"   },
+    {  3.0f, "4 M 3 Nm"   },
+    {  5.0f, "5 M 5 Nm"   },
+    {  8.0f, "6 M 8 Nm"   },
+    { 12.0f, "7 M 12 Nm"  },
+    { 16.0f, "8 M 16 Nm"  },
+    { 20.0f, "9 M 20 Nm"  },
+    { 25.0f, "10 M 25 Nm" },
   };
   const int NSEQ = (int)(sizeof seq / sizeof seq[0]);
 
@@ -514,7 +515,7 @@ void App_Process(void)
     seq_idx = (seq_idx + 1) % NSEQ;             /* advance to the next state */
 
     if (seq_idx == 0) Reg_SetMode(OUT_OFF);
-    else              Reg_SetSetpoint_mA(seq[seq_idx].mA);
+    else              Reg_SetTorqueSetpoint_Nm(seq[seq_idx].Nm);
 
     char b[64];
     snprintf(b, sizeof b, "\r\n[BTN] step %s (of %d)\r\n", seq[seq_idx].name, NSEQ);
