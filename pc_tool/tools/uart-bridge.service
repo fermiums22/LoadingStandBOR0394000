@@ -1,6 +1,9 @@
 [Unit]
 Description=Loading-stand UART (ttyAMA5) to TCP bridge for DriveScope
-After=network.target
+# Start only after the self-written AP-fallback script has settled the network
+# (smart-wifi.service is a oneshot that joins Wi-Fi or raises the hotspot).
+After=network.target smart-wifi.service
+Wants=smart-wifi.service
 
 [Service]
 Type=simple
